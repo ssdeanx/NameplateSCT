@@ -16,8 +16,20 @@ NameplateSCT.frame = CreateFrame("Frame", nil, UIParent)
 
 local GetSpellTexture = C_Spell and C_Spell.GetSpellTexture or GetSpellTexture
 local _, _, _, build = GetBuildInfo()
-local isMidnight = build >= 120000
-local blizzardCvar = isMidnight and "floatingCombatTextCombatDamage_v2" or "floatingCombatTextCombatDamage"
+local WOW_PROJECT_CAMELOT = _G.WOW_PROJECT_CAMELOT or 18
+local isForever = (WOW_PROJECT_ID == WOW_PROJECT_CAMELOT) or (build == 16001)
+local isMidnight = (build >= 120000)
+local isModernCvar = isMidnight or isForever
+local blizzardCvar = isModernCvar and "floatingCombatTextCombatDamage_v2" or "floatingCombatTextCombatDamage"
+
+local function isSecretValue(v)
+	local issecret = _G.issecretvalue
+	if type(issecret) == "function" then
+		local ok, res = pcall(issecret, v)
+		return ok and (res == true)
+	end
+	return false
+end
 
 ------------
 -- LOCALS --
@@ -292,7 +304,7 @@ local DAMAGE_TYPE_COLORS = {
 	[SCHOOL_MASK_ARCANE + SCHOOL_MASK_FIRE] = "FF808C", -- Spellfire
 	[SCHOOL_MASK_ARCANE + SCHOOL_MASK_NATURE] = "AFB9AF", -- Astral
 	[SCHOOL_MASK_ARCANE + SCHOOL_MASK_FROST] = "C0C0FF", -- Spellfrost
-	[SCHOOL_MASK_ARCANE + SCHOOL_MASK_FROST] = "B980FF", -- Spellshadow
+	[SCHOOL_MASK_ARCANE + SCHOOL_MASK_SHADOW] = "B980FF", -- Spellshadow
 	[SCHOOL_MASK_FIRE + SCHOOL_MASK_FROST + SCHOOL_MASK_NATURE] = "0070DE", -- Elemental
 	[SCHOOL_MASK_FIRE + SCHOOL_MASK_FROST + SCHOOL_MASK_ARCANE + SCHOOL_MASK_NATURE + SCHOOL_MASK_SHADOW] = "C0C0C0", -- Chromatic
 	[SCHOOL_MASK_FIRE + SCHOOL_MASK_FROST + SCHOOL_MASK_ARCANE + SCHOOL_MASK_NATURE + SCHOOL_MASK_SHADOW + SCHOOL_MASK_HOLY] = "1111FF", -- Magic
@@ -513,10 +525,14 @@ end
 function NameplateSCT:OnEnable()
 	playerGUID = UnitGUID("player")
 
-	if not isMidnight then -- disable for midnight :(
-		self:RegisterEvent("NAME_PLATE_UNIT_ADDED")
-		self:RegisterEvent("NAME_PLATE_UNIT_REMOVED")
-		self:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
+	self:RegisterEvent("NAME_PLATE_UNIT_ADDED")
+	self:RegisterEvent("NAME_PLATE_UNIT_REMOVED")
+
+	local isRestricted = (C_CombatLog and C_CombatLog.IsCombatLogRestricted and C_CombatLog.IsCombatLogRestricted())
+		or (C_Secrets and C_Secrets.HasSecretRestrictions and C_Secrets.HasSecretRestrictions())
+
+	if not isRestricted then
+		pcall(self.RegisterEvent, self, "COMBAT_LOG_EVENT_UNFILTERED")
 	end
 
 	self.db.global.enabled = true
@@ -722,7 +738,7 @@ local function AnimationOnUpdate()
 					local easedProgress = GetLinearEasing(progress)
 					local distance = (fontString.fireworksDistance or 100) * easedProgress
 
-					 -- Get the configured starting radius
+					-- Get the configured starting radius
 					local startRadius = NameplateSCT.db.global.animations.fireworksRadius
 					xOffset = (startRadius + distance) * math.cos(angle)
 					yOffset = (startRadius + distance) * math.sin(angle)
@@ -802,19 +818,26 @@ end
 ------------
 
 function NameplateSCT:NAME_PLATE_UNIT_ADDED(event, unitID)
+	if event ~= "NAME_PLATE_UNIT_ADDED" or not unitID then return end
+
 	local guid = UnitGUID(unitID)
+	if not guid or isSecretValue(guid) then return end
 
 	unitToGuid[unitID] = guid
 	guidToUnit[guid] = unitID
 end
 
 function NameplateSCT:NAME_PLATE_UNIT_REMOVED(event, unitID)
+	if event ~= "NAME_PLATE_UNIT_REMOVED" or not unitID then return end
+
 	local guid = unitToGuid[unitID]
 
 	unitToGuid[unitID] = nil
-	guidToUnit[guid] = nil
+	if guid and not isSecretValue(guid) then
+		guidToUnit[guid] = nil
+	end
 
-	-- recycle any fontStrings attachedk to this unit
+	-- recycle any fontStrings attached to this unit
 	for fontString, _ in pairs(animating) do
 		if fontString.unit == unitID then
 			recycleFontString(fontString)
@@ -823,8 +846,10 @@ function NameplateSCT:NAME_PLATE_UNIT_REMOVED(event, unitID)
 end
 
 function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, destGUID, _, _, _, ...)
+    if not clue or isSecretValue(clue) or isSecretValue(sourceGUID) or isSecretValue(destGUID) then return end
+    playerGUID = playerGUID or UnitGUID("player")
     if NameplateSCT.db.global.personalOnly and NameplateSCT.db.global.personal and playerGUID ~= destGUID then return end -- Cancel out any non player targetted abilities if you have personalSCT only enabled
-	if NameplateSCT.db.global.filterEnabled then -- Filter out mobId's if needed
+	if NameplateSCT.db.global.filterEnabled and destGUID then -- Filter out mobId's if needed
 		local _, _, _, _, _, destUnitId = strsplit("-", destGUID)
 		destUnitId = tostring(destUnitId) or "1"
 		if (NameplateSCT.db.global.inverseNPCFilter and not npcFiltersTable[destUnitId]) -- Inverse filter
@@ -836,7 +861,7 @@ function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, de
 		local destUnit = guidToUnit[destGUID]
 		if (destUnit) or (destGUID == playerGUID and NameplateSCT.db.global.personal) then
 			if string.find(clue, "_MISSED") then
-				local spellName, missType, spellId, amount, school
+				local spellName, missType, spellId, amount, school, critical
 
 				if (string.find(clue, "SWING")) then
 					missType, _, amount, critical = ...
@@ -878,11 +903,11 @@ function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, de
 				self:DamageEvent(destGUID, spellName, amount, overkill, school, critical, spellId, absorbed)
 			end
 		end
-	elseif (bit.band(sourceFlags, COMBATLOG_OBJECT_TYPE_GUARDIAN) > 0 or bit.band(sourceFlags, COMBATLOG_OBJECT_TYPE_PET) > 0)	and bit.band(sourceFlags, COMBATLOG_OBJECT_AFFILIATION_MINE) > 0 then -- Pet/Guardian events
+	elseif sourceFlags and (bit.band(sourceFlags, COMBATLOG_OBJECT_TYPE_GUARDIAN) > 0 or bit.band(sourceFlags, COMBATLOG_OBJECT_TYPE_PET) > 0) and bit.band(sourceFlags, COMBATLOG_OBJECT_AFFILIATION_MINE) > 0 then -- Pet/Guardian events
 		local destUnit = guidToUnit[destGUID]
 		if (destUnit) or (destGUID == playerGUID and NameplateSCT.db.global.personal) then
 			if string.find(clue, "_MISSED") then
-				local spellName, missType, spellId, amount
+				local spellName, missType, spellId, amount, critical
 
 				if (string.find(clue, "SWING")) then
 					missType, _, amount, critical = ...
@@ -926,7 +951,10 @@ function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, de
 end
 
 function NameplateSCT:COMBAT_LOG_EVENT_UNFILTERED ()
-	return NameplateSCT:CombatFilter(CombatLogGetCurrentEventInfo())
+	local getEventInfo = C_CombatLog and C_CombatLog.GetCurrentEventInfo or CombatLogGetCurrentEventInfo
+	if getEventInfo then
+		return NameplateSCT:CombatFilter(getEventInfo())
+	end
 end
 
 -------------
@@ -941,7 +969,13 @@ local function commaSeperate(number)
 end
 
 function NameplateSCT:truncateText(amount)
-	local text = ''
+	if isSecretValue(amount) then
+		return amount
+	end
+	if type(amount) ~= "number" then
+		return tostring(amount)
+	end
+	local text
 	if self.db.global.truncateMethod == 'NONE' then
 		if (self.db.global.commaSeperate) then
 			text = commaSeperate(amount)
@@ -995,29 +1029,36 @@ local numDamageEvents = 0
 local lastDamageEventTime
 local runningAverageDamageEvents = 0
 function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, crit, spellId, absorbed)
-	local amount = amount or 0
-	local absorbed = absorbed or 0
+	local isSecretAmount = isSecretValue(amount)
+	local isSecretAbsorbed = isSecretValue(absorbed)
+	local isSecretCrit = isSecretValue(crit)
+
+	amount = amount or 0
+	absorbed = absorbed or 0
 	local onPlayer = guid == playerGUID
 
 	-- Hide small hits based on threshold
-	if self.db.global.sizing.hideSmallHitsThreshold > (amount + absorbed) then
-		return
+	if not isSecretAmount and not isSecretAbsorbed then
+		if self.db.global.sizing.hideSmallHitsThreshold > (amount + absorbed) then
+			return
+		end
 	end
 
-	local text, animation, pow, size, alpha
+	local text, animation, pow, size
 	local autoattack = spellName == "melee" or spellName == "pet"
+	local critFlag = (not isSecretCrit) and (crit == true or crit == 1)
 
 	-- select an animation
-	if (autoattack and crit) then
+	if (autoattack and critFlag) then
 		animation = not onPlayer and self.db.global.animations.autoattackcrit or self.db.global.animationsPersonal.crit
 		pow = true
 	elseif (autoattack) then
 		animation = not onPlayer and self.db.global.animations.autoattack or self.db.global.animationsPersonal.normal
 		pow = false
-	elseif (crit) then
+	elseif (critFlag) then
 		animation = not onPlayer and self.db.global.animations.crit or self.db.global.animationsPersonal.crit
 		pow = true
-	elseif (not autoattack and not crit) then
+	elseif (not autoattack and not critFlag) then
 		animation = not onPlayer and self.db.global.animations.ability or self.db.global.animationsPersonal.normal
 		pow = false
 	end
@@ -1036,31 +1077,33 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
 
 	if (self.db.global.useOffTargetAppearance and not isTarget and not onPlayer) then
 		size = self.db.global.offTargetFormatting.size
-		alpha = self.db.global.offTargetFormatting.alpha
 	else
 		size = self.db.global.formatting.size
-		alpha = self.db.global.formatting.alpha
 	end
 
     if not NameplateSCT.db.global.showIconOnly then
-        -- truncate
-        text = self:truncateText(amount)
+        if isSecretAmount then
+            text = amount
+        else
+            -- truncate
+            text = self:truncateText(amount)
 
-        -- if damage was done to the player, negate the amount.
-        if onPlayer then
-            text = ("-%s"):format(text)
-        end
+            -- if damage was done to the player, negate the amount.
+            if onPlayer then
+                text = ("-%s"):format(text)
+            end
 
-        if NameplateSCT.db.global.showAbsorbDamage and absorbed > 0 then
-            local absorbedText = self:truncateText(absorbed)
-            text = L["%s (A: %s)"]:format(text, absorbedText)
+            if NameplateSCT.db.global.showAbsorbDamage and not isSecretAbsorbed and absorbed > 0 then
+                local absorbedText = self:truncateText(absorbed)
+                text = L["%s (A: %s)"]:format(text, absorbedText)
+            end
+            -- color text
+            text = self:ColorText(text, guid, playerGUID, school, spellName, crit)
         end
-        -- color text
-        text = self:ColorText(text, guid, playerGUID, school, spellName, crit)
     end
 
 	-- shrink small hits
-	if (self.db.global.sizing.smallHits or self.db.global.sizing.smallHitsHide) and not onPlayer then
+	if not isSecretAmount and (self.db.global.sizing.smallHits or self.db.global.sizing.smallHitsHide) and not onPlayer then
 		if (not lastDamageEventTime or (lastDamageEventTime + SMALL_HIT_EXPIRY_WINDOW < GetTime())) then
 			numDamageEvents = 0
 			runningAverageDamageEvents = 0
@@ -1070,8 +1113,8 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
 		numDamageEvents = numDamageEvents + 1
 		lastDamageEventTime = GetTime()
 
-		if ((not crit and amount < SMALL_HIT_MULTIPIER*runningAverageDamageEvents)
-			or (crit and amount/2 < SMALL_HIT_MULTIPIER*runningAverageDamageEvents)) then
+		if ((not critFlag and amount < SMALL_HIT_MULTIPIER*runningAverageDamageEvents)
+			or (critFlag and amount/2 < SMALL_HIT_MULTIPIER*runningAverageDamageEvents)) then
 			if self.db.global.sizing.smallHitsHide then
 				-- skip this damage event, it's too small
 				return
@@ -1082,7 +1125,7 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
 	end
 
 	-- embiggen crit's size
-	if (self.db.global.sizing.crits and crit) and not onPlayer then
+	if (self.db.global.sizing.crits and critFlag) and not onPlayer then
 		if (autoattack and not self.db.global.sizing.autoattackcritsizing) then
 			-- don't embiggen autoattacks
 			pow = false
@@ -1098,7 +1141,7 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
 
     if NameplateSCT.db.global.showIconOnly then
         self:DisplayIconWithoutText(guid, size, animation, spellId, pow, spellName)
-    elseif (type(overkill) == "number" and overkill > 0 and (self.db.global.shouldDisplayOverkill or onPlayer)) then
+    elseif (not isSecretAmount and type(overkill) == "number" and overkill > 0 and (self.db.global.shouldDisplayOverkill or onPlayer)) then
         text = self:ColorText(L["%s (O: %s)"]:format(text, self:truncateText(overkill)), guid, playerGUID, school, spellName, crit)
         self:DisplayTextOverkill(guid, text, size, animation, spellId, pow, spellName)
     else
@@ -1107,7 +1150,7 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
 end
 
 function NameplateSCT:MissEvent(guid, spellName, missType, spellId)
-	local text, animation, pow, size, alpha, color
+	local text, animation, pow, size, color
 	local unit = guidToUnit[guid]
 	local isTarget = unit and UnitIsUnit(unit, "target")
 
@@ -1124,10 +1167,8 @@ function NameplateSCT:MissEvent(guid, spellName, missType, spellId)
 
 	if (self.db.global.useOffTargetAppearance and not isTarget and playerGUID ~= guid) then
 		size = self.db.global.offTargetFormatting.size
-		alpha = self.db.global.offTargetFormatting.alpha
 	else
 		size = self.db.global.formatting.size
-		alpha = self.db.global.formatting.alpha
 	end
 
 	-- embiggen miss size
@@ -1137,8 +1178,12 @@ function NameplateSCT:MissEvent(guid, spellName, missType, spellId)
 
 	pow = true
 
-	text = MISS_EVENT_STRINGS[missType] or L["Missed"]
-	text = "|Cff"..color..text.."|r"
+	if isSecretValue(missType) then
+		text = missType
+	else
+		text = MISS_EVENT_STRINGS[missType] or L["Missed"]
+		text = "|Cff"..color..text.."|r"
+	end
 
 	self:DisplayText(guid, text, size, animation, spellId, pow, spellName)
 end
@@ -1154,7 +1199,7 @@ function NameplateSCT:DisplayText(guid, text, size, animation, spellId, pow, spe
 	end
 
 	-- if there isn't an anchor frame, make sure that there is a guidNameplatePosition cache entry
-	if playerGUID == guid and not unit then
+	if guid and playerGUID == guid and not unit then
 		nameplate = "player"
 	elseif (not nameplate) then
 		return
@@ -1171,7 +1216,7 @@ function NameplateSCT:DisplayText(guid, text, size, animation, spellId, pow, spe
 	fontString.startHeight = fontString:GetStringHeight()
 	fontString.pow = pow
 
-	if (fontString.startHeight <= 0) then
+	if (not fontString.startHeight or type(fontString.startHeight) ~= "number" or fontString.startHeight <= 0) then
 		fontString.startHeight = 5
 	end
 
@@ -1230,7 +1275,7 @@ function NameplateSCT:DisplayIconWithoutText(guid, size, animation, spellId, pow
 	end
 
 	-- if there isn't an anchor frame, make sure that there is a guidNameplatePosition cache entry
-	if playerGUID == guid and not unit then
+	if guid and playerGUID == guid and not unit then
 		nameplate = "player"
 	elseif (not nameplate) then
 		return
@@ -1294,10 +1339,7 @@ end
 function NameplateSCT:DisplayTextOverkill(guid, text, size, animation, spellId, pow, spellName)
 	local fontString
 	local icon
-	local unit = guidToUnit[guid]
-	local nameplate
-
-	nameplate = "player"
+	local nameplate = "player"
 
 	fontString = getFontString()
 
@@ -1310,7 +1352,7 @@ function NameplateSCT:DisplayTextOverkill(guid, text, size, animation, spellId, 
 	fontString.startHeight = fontString:GetStringHeight()
 	fontString.pow = pow
 
-	if (fontString.startHeight <= 0) then
+	if (not fontString.startHeight or type(fontString.startHeight) ~= "number" or fontString.startHeight <= 0) then
 		fontString.startHeight = 5
 	end
 
@@ -1357,9 +1399,12 @@ function NameplateSCT:DisplayTextOverkill(guid, text, size, animation, spellId, 
 	self:Animate(fontString, nameplate, duration, animation)
 end
 
-function NameplateSCT:ColorText(startingText, guid, playerGUID, school, spellName, crit)
+function NameplateSCT:ColorText(startingText, guid, pGUID, school, spellName, crit)
+	if isSecretValue(startingText) then
+		return startingText
+	end
 	local finalText
-	if guid ~= playerGUID then
+	if guid ~= (pGUID or playerGUID) then
 		if crit and self.db.global.useCritColor then
 			finalText = "|Cff"..self.db.global.critColor..startingText.."|r"
 		elseif self.db.global.damageColor and school and DAMAGE_TYPE_COLORS[school] then
