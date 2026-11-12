@@ -674,13 +674,20 @@ local function AnimationOnUpdate()
 
 				-- frame level
 				local frame = fontString:GetParent()
-				local strataRequired = (isTarget) and NameplateSCT:GetStrata(NameplateSCT.db.global.strata.target) or NameplateSCT:GetStrata(NameplateSCT.db.global.strata.offTarget)
+				local strataRequired
+				if canaccessvalue(isTarget) and isTarget then
+					strataRequired = NameplateSCT:GetStrata(NameplateSCT.db.global.strata.target)
+				else
+					strataRequired = NameplateSCT:GetStrata(NameplateSCT.db.global.strata.offTarget)
+				end
 				frame:SetFrameStrata(strataRequired)
 
 				-- alpha
 				local startAlpha = NameplateSCT.db.global.formatting.alpha
-				if (NameplateSCT.db.global.useOffTargetAppearance and not isTarget and fontString.unit ~= "player") then
-					startAlpha = NameplateSCT.db.global.offTargetFormatting.alpha
+				if canaccessvalue(isTarget) then
+					if (NameplateSCT.db.global.useOffTargetAppearance and not isTarget and fontString.unit ~= "player") then
+						startAlpha = NameplateSCT.db.global.offTargetFormatting.alpha
+					end
 				end
 
 				local alpha = LibEasing.InExpo(elapsed, startAlpha, -startAlpha, fontString.animatingDuration)
@@ -824,7 +831,9 @@ function NameplateSCT:NAME_PLATE_UNIT_ADDED(event, unitID)
 	if not guid or isSecretValue(guid) then return end
 
 	unitToGuid[unitID] = guid
-	guidToUnit[guid] = unitID
+	if canaccessvalue(guid) then
+		guidToUnit[guid] = unitID
+	end
 end
 
 function NameplateSCT:NAME_PLATE_UNIT_REMOVED(event, unitID)
