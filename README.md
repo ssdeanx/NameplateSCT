@@ -38,7 +38,9 @@ plate — and an optional screen area for when you play without nameplates.
 | 🎨 **Colour swatches** | Pick a colour from a palette, or type the hex value. |
 | 💾 **Backup** | Export your look as a text block and paste it back. |
 | 🎨 **Your type** | Any LibSharedMedia font, outline presets, text shadow, per-school colours. |
-| 🏷️ **Icons** | Spell icons on the number, with Masque skinning if you use it. |
+| ⚕️ **Healing** | Incoming heals with their own colour, crit colour, animation and switch. |
+| 🎚️ **Kinds of hit** | Melee, spell, ranged, DoT, heals and pet damage each switch on their own. |
+| 🏷️ **Icons** | Spell icons on the number, with Masque skinning if you use it — off by default. |
 | 🎞️ **Animations** | Vertical, fountain, rainfall and fireworks, each tuned per hit type. |
 | 🚫 **Filters** | Hide specific spells or NPCs, or allow only the listed ones. |
 | 💾 **Profiles** | AceDB profiles: new, copy, delete, reset — settings follow the profile. |
@@ -113,19 +115,22 @@ were.
 
 The dashboard is a diagnostic tool, not just a settings page.
 
-**Six automatic checks** run continuously, each with a colour and a one-line fix:
+**Seven automatic checks** run continuously, each with a colour and a one-line fix:
 
 - addon enabled
 - event source subscribed
 - enemy nameplates visible (skipped in screen mode)
 - combat events arriving in the last 15 seconds
 - numbers reaching the screen in the last 15 seconds
-- Blizzard's own text not doubling up
+- Blizzard's own text not doubling up (read from the client's own combat-text frame, not from
+  the addon's CVar write)
+- no other addon drawing numbers (`PlateSCT`, `ClassicFCT`) — because "I turned it off and they
+  still show" is usually a second addon
 
 **Counters** track events received, numbers drawn, misses, duplicates collapsed, secret amounts,
 client refusals, and the active/pooled FontString count. Every early return in the combat path
 records *why* it dropped a hit — under the threshold, off-target text off, no nameplate for the
-unit, target-of-target, animation disabled, healing, filters — and the dashboard shows the last
+unit, target-of-target, a switched-off category, healing off, animation disabled, filters — and the dashboard shows the last
 reason and how often it happened. "Events arrive but nothing is drawn" now has an answer instead
 of a guess.
 
@@ -150,12 +155,26 @@ are animated together.
 
 - **School colours** — physical, holy, fire, nature, frost, shadow, arcane and the combined
   schools, or one colour for everything.
-- **Crit and miss colours** — separate colours for critical hits and for dodges/parries/misses.
+- **Normal and critical hits** — a normal-hit colour and a crit colour, each with its own hex
+  field and swatch. Crits work on every client: the reduced clients report the same `CRITICAL`
+  flag Blizzard's own combat feedback reads.
+- **Misses** — separate miss colours for other units and for you.
 - **Your own damage taken** — its own colour and miss colour.
+- **Healing** — a heal colour, an optional heal crit colour, and the heal animations.
 - **Fonts** — every font LibSharedMedia provides; unknown names fall back to your client's
   default font, so CJK and Cyrillic clients look right.
-- **Icons** — show the spell icon next to the number, icons only, borderless, scaled, and
-  skinned by Masque if it is installed.
+- **Icons** — off by default; tick *Show spell icons* to put the spell icon next to the
+  number, icons only, borderless, scaled, and skinned by Masque if it is installed.
+
+## 📍 Where numbers about you are mounted
+
+Numbers about you — damage you take and heals on you — can be mounted in either of two places:
+
+- **Screen area** — the configured point from screen centre (the Incoming area).
+- **Your unit frame** — they rise from your player frame, like the plate text does.
+
+PlateSCT reached the second look by dragging its Incoming area over the frame; here it is a
+setting, and the offsets under *On you* still apply in both cases.
 
 ## 🚫 Filters
 
@@ -169,12 +188,19 @@ them.
 
 ## 🎯 Off-target numbers
 
-A hit that lands on a mob you are **not** targeting is drawn in the off-target style: its own
-size, its own opacity, and one stratum lower so it never covers the target's numbers. You can
+"Off-target" is literal: it means **not the unit you currently have targeted** — not "my
+target's target". The addon asks the client whether the hit unit is your target, and every unit
+that answers "no" is drawn in the off-target style (if the client cannot compare the units, the
+number is kept rather than hidden).
+
+A hit that lands on a mob you are not targeting gets its own size, its own opacity, and one
+stratum lower so it never covers the target's numbers. You can
 
 - give it a completely separate look (**General → Use a separate off-target look**),
 - or switch it off entirely (**General → Show text that is not on your target**) and only ever see
-  numbers from your current target.
+  numbers from your current target,
+- and damage *you* take is off by default (**General → Show damage you take**), including when
+  the client reports it under an alias that points back at you.
 
 The Appearance preview shows both styles side by side, so you can tune them without pulling a mob.
 
@@ -193,8 +219,25 @@ The Appearance preview shows both styles side by side, so you can tune them with
 <details>
 <summary><b>I see numbers twice</b></summary>
 
-Blizzard draws its own nameplate damage text. Turn on **Hide Blizzard's own numbers** (Dashboard or
-General) so the two cannot double up.
+Blizzard draws its own nameplate damage text. Turn on **Hide Blizzard's own numbers** (Dashboard
+or General) so the two cannot double up.
+
+On the modern clients (`Forever`, `Midnight`) damage and healing text has **no per-category
+setting at all** — the client only checks `enableFloatingCombatText`, and the addon turns that
+off and then stops the client's combat-text frame from receiving events, so the numbers stop in
+the current session rather than after a reload. The per-category switches (avoidance,
+block/absorb, DoTs) are turned off too for the classic clients, which do read them.
+
+This client has **no per-category switch below the master**, so the toggle stops *all* of
+Blizzard's floating text: damage (pets included), healing, absorbs, misses, gains, auras and
+combat-state messages. That is what makes room for the addon's own numbers — including its
+healing, which has its own switch, colour and animation, so you do not lose heal text by hiding
+Blizzard's.
+
+Turning the setting back off hands your previous values back, and so does turning the addon
+itself off. The dashboard check is green only when the client's own frame is actually
+unregistered — not because a CVar read "0". If it is still green and numbers remain, the
+**No other addon drawing numbers** check names the culprit.
 </details>
 
 <details>
@@ -221,7 +264,7 @@ scaling, crit animations) are disabled on clients that hide the combat log, and 
 
 ## 🧪 Quality
 
-- **182 offline checks** drive real events through the combat path: event source, secret values,
+- **273 offline checks** drive real events through the combat path: event source, secret values,
   de-duplication, misses, thresholds, off-target styling, the shadow, the preview, the settings
   audit and the window itself.
 - **Every setting is proved wired**: each control declares the saved key it owns, and the suite
@@ -250,7 +293,7 @@ authors, and to everyone who reported a bug with a real error log.
 ```bash
 wowlua_ls check .                          # client-aware diagnostics
 luacheck NameplateSCT.lua Options/ Tests/  # style
-bash Tests/run.sh                          # 182 checks
+bash Tests/run.sh                          # 273 checks
 ```
 
 The addon targets Lua 5.1. Every TOC declares its own interface; the client picks the file. Tests

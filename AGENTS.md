@@ -117,6 +117,25 @@ applicable) → `DisplayText` (resolve plate or screen-area anchor) → `Animate
   in `AddOns.txt`, which alone produces the "nothing shows up" symptom.
 - `LoadAddOn`/`Settings` APIs do not exist on every client: guard with `pcall` rather than
   assuming the retail `Settings` table.
+- **Colour is a FontString property, never an inline `|Cff` code.** A secret amount cannot be
+  concatenated, so wrapping it both fails the secret contract and leaves the number white on the
+  restricted clients — every colour setting silently did nothing until 1.64. Keep the text plain
+  and call `FontString:SetTextColor` with plain numbers resolved before the text is written
+  (`GetTextColor` / `GetHealColor`).
+- `UNIT_COMBAT` carries `flagText` (`CRITICAL`, `CRUSHING`, `GLANCING`, `ABSORB`, `BLOCK`,
+  `RESIST`), which is the same string Blizzard's `CombatFeedback_OnCombatEvent` reads. Crit
+  colour, crit sizing and crit animations therefore work on Forever; they are not combat-log-only.
+- Blizzard's floating combat text is **not** gated by the per-category CVars on the modern
+  clients. `CombatTextTypeInfo` declares `DAMAGE`, `DAMAGE_CRIT`, `SPELL_DAMAGE` and the `HEAL`
+  entries with `show = 1` and **no `cvar`**, so writing `floatingCombatTextCombatDamage_v2`
+  changes nothing and reading it back proves nothing. The only switch is
+  `enableFloatingCombatText`: `CombatText:OnLoad()` (and the settings callback) calls
+  `CombatTextUtil.UpdateEventRegistration(frame, GetCVarBool(master))`, so with "0" the frame is
+  not registered for `COMBAT_TEXT_UPDATE` and never draws. The addon writes that CVar **and**
+  performs the registration call itself (the CVar only lands on the next load). Verify from the
+  client — `CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE")` — never from our own write; a
+  dashboard that trusts the write is exactly how 1.64 shipped a green check over numbers that
+  kept drawing. Source: `origin/forever`, `Interface/AddOns/Blizzard_CombatText/Shared/`.
 
 ## 6. Deployment
 

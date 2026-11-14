@@ -1,5 +1,208 @@
 # NameplateSCT
 
+## [1.64] (2026-11-14)
+
+### Fixed: turning off Blizzard's numbers did nothing visible
+
+The addon was steering the wrong switch. Reading the client's own combat-text code
+(`Blizzard_CombatText`, forever branch) explains the whole report:
+
+- `CombatTextTypeInfo` gives **damage and healing no CVar at all** - `DAMAGE`, `DAMAGE_CRIT`,
+  `SPELL_DAMAGE`, `HEAL`, `PERIODIC_HEAL` and friends are declared with `show = 1` and no
+  `cvar` field. Only avoidance, block/absorb, auras, gains and combat-state text carry one.
+- What actually stops everything is the master switch `enableFloatingCombatText`:
+  `CombatText:OnLoad()` calls `CombatTextUtil.UpdateEventRegistration(self, GetCVarBool(master))`
+  and the settings callback repeats it when the value flips. With "0" the frame never registers
+  for `COMBAT_TEXT_UPDATE`, so `OnEvent` never runs.
+- So the old code wrote `floatingCombatTextCombatDamage_v2`, read it back as "0", and the client
+  never looked at it - a green check over numbers that were still drawing. That is why the
+  dashboard reported success while the numbers stayed.
+
+The addon now turns off `enableFloatingCombatText`, and then drives the same registration call
+itself so the change lands in the current session instead of after the next reload. Turning the
+setting off hands the player's own values back and re-registers the client's renderer. The
+per-category CVars are still steered as a second line of defence for the classic families, whose
+`FloatingCombatText` reads them directly.
+
+- **The write itself never landed either.** `SetCVar` takes a cstring value, and a rejected call
+  does not raise - so passing the number `0` changed nothing while the toggle still looked on.
+  The value is written as a string, read back to prove it stuck, and retried through
+  `C_CVar.SetCVar` when the legacy global refuses. A client that still refuses is reported on the
+  dashboard ("this client refused the CVar change") instead of looking like a broken toggle.
+- A CVar this client does not expose is now skipped rather than counted as a failure, so the
+  failure count means "the client refused", not "this family has fewer switches".
+- The setting is re-applied on `PLAYER_ENTERING_WORLD`, because a loading screen can reset it.
+- It was silently skipped in Screen mode, so the toggle did nothing at all for screen-mode
+  players. The setting is honoured in both modes now, because it is the player's explicit
+  choice rather than something the addon should decide from the display mode.
+- **The dashboard check asks the client, not the CVar.** It reads
+  `CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE")`, so it is green only when the renderer
+  actually stopped, and the failure hint names the reason ("the client is still drawing its own
+  text", "enableFloatingCombatText still reads 1"). `Copy details` reports `fct=off` or
+  `fct=on: <reason>`.
+- **Turning the addon itself off hands the text back.** Muting the client while drawing nothing
+  of our own would leave the player with no numbers at all, so suppression requires both
+  *Addon enabled* and *Hide Blizzard's own numbers*.
+- **The restore value can never be "0".** The record of what the switches held is per session;
+  after a reload there is nothing to hand back, so a switch that already reads "0" is recorded
+  at the client's own default instead. Un-ticking the setting gives the text back in every
+  order of events, and a client setting the player made themselves is still left alone.
+- **The setting stays authoritative.** If the game's own options (or another addon) turn
+  Blizzard's text back on while the toggle is on, a `CVAR_UPDATE` handler puts it back. The
+  echo of the addon's own write is recognised and skipped, so this is not a write loop.
+- **A new dashboard check names another addon drawing numbers.** With *PlateSCT*, *ClassicFCT*
+  or a similar addon loaded, "I turned Blizzard's off and they still show" is reported by name
+  instead of looking like this toggle failing.
+
+### Added: one switch per kind of hit
+
+Every category the client reports now has a control instead of an implicit yes: **melee**,
+**spell**, **ranged**, **damage over time**, **healing** and **pet damage**. A switched-off
+category drops with its own recorded reason ("that kind of damage is off") so the dashboard
+still answers why a number did not appear. Pet damage is marked *combat log only*: `UNIT_COMBAT`
+reports the victim and the action but never the source, so no addon can tell a pet's hit from
+yours on Forever.
+
+### Added: healing
+
+`HEAL` was dropped outright; it is drawn now, on the unit that received it, prefixed with `+` and
+coloured with its own settings - a heal colour, an optional heal crit colour, and a heal / heal
+crit animation pair. Heals on you follow the "show damage you take" placement but not its switch:
+a heal is not damage, so it shows even with that setting off. On the combat-log clients the same
+path covers `SPELL_HEAL` and `SPELL_PERIODIC_HEAL`.
+
+### Fixed: colours now reach the screen on Forever
+
+Colour was applied by wrapping the number in `|Cff...|r`. A secret amount may not be
+concatenated, so on the restricted clients every colour setting was silently doing nothing - the
+numbers were plain white. Colour is applied with `FontString:SetTextColor` now, from plain
+numbers worked out before the text is written, so school colours, the normal-hit colour, the crit
+colour, the miss colours and the heal colours all work on every client, and the shadow keeps its
+own colour.
+
+### Added: crits on the reduced clients
+
+`UNIT_COMBAT` carries the same flag Blizzard's own combat feedback reads (`CRITICAL`, `CRUSHING`,
+`GLANCING`), so crit colour, crit sizing and the crit animation are no longer combat-log-only.
+They were previously disabled on Forever because the old code never looked at that flag.
+
+### Added: where numbers about you are mounted
+
+*Numbers about you* (damage you take, heals on you) can be mounted to the **screen area** or to
+**your unit frame**, so they rise from your player frame the way PlateSCT's Incoming area does
+when it is dragged over it. The *On you* offsets apply in both cases, and a unit frame the client
+is not showing falls back to the screen instead of dropping the number.
+
+### Scope: what the switch really turns off
+
+`enableFloatingCombatText` is the whole renderer, so the answer is *everything* Blizzard draws:
+
+- damage of every kind - melee, spell, ranged, periodic, and **pet damage** (a pet's hit is an
+  ordinary damage event on the mob's unit)
+- **healing**, absorbs, blocks and resists
+- misses, dodges, parries, evades, immunes, deflects
+- mana/energy/rage gains, honour and reputation changes, auras, reactives, combo points,
+  entering and leaving combat, low-health and low-mana warnings
+
+The consequence has to be said plainly: the addon draws **damage only** - `HEAL` and `ENERGIZE`
+have always been dropped - so with the switch on there are no heal numbers anywhere, yours or
+anyone else's. That is the client's design, not a gap in the toggle: on Forever a message
+category with no CVar cannot be silenced on its own, and the only switch below "everything" is
+"everything". Untick *Hide Blizzard's own numbers*, or disable the addon, and Blizzard's text
+comes back as it was.
+
+On the classic families it is finer-grained: those clients read
+`floatingCombatTextCombatHealing` and friends directly, so the same toggle steers the categories
+this addon replaces (damage, DoTs, avoidance, block/absorb) and leaves healing, gains, auras and
+loot text alone.
+
+### Changed: spell icons are off by default
+
+Spell icons made a first install noisier than the numbers themselves. **Show spell icons** now
+starts off, and an existing profile is moved over **once**, recorded on the saved variable, so a
+player who turns them back on afterwards keeps them.
+
+### Fixed: damage to you could still draw
+
+Damage you take can reach `UNIT_COMBAT` under an alias that points at you rather than the
+`player` token: while a mob is hitting you, your target's target *is* you. That token was not
+treated as personal, so in screen mode it was drawn on the outgoing side even with **Show damage
+you take** off. Any token the client compares equal to the player is promoted to the player
+now, which puts it under the same setting, on the incoming side, and in the same duplicate
+bucket. Damage to you stays off by default.
+
+### Clarified: what "off-target" means
+
+It is literal: *not the unit you currently have targeted*, not "my target's target". A hit on
+any other mob's plate is drawn with the off-target size, opacity and stratum; your current
+target keeps the normal look. `UnitIsUnit(unit, "target")` answers the question, and when the
+restricted client refuses to compare, the number is kept rather than hidden.
+
+### Tests
+
+273 checks (was 189): the master switch goes off and the client's own renderer is unregistered,
+a combat-text tick draws nothing while the setting is on, a CVar that reads "0" while the
+renderer is still registered is reported as **not** stopped (the 1.64 green-check bug, pinned),
+re-applying re-asserts the registration without relying on the client's settings callback,
+turning the setting off restores the player's values and the renderer, a record lost to a reload
+still hands the text back, a client setting the player made themselves is left alone, turning the
+addon off hands the text back and turning it on mutes it again, a CVar the client does not expose
+is not counted, unrelated CVars are left alone, a refused write is counted while the other
+switches still change and the renderer still stops, the failure count clears on a clean pass, the
+status helper answers from the client rather than from the addon's write, another loaded
+number-drawing addon is named, each kind of hit is proved to obey its own switch, a heal draws
+with a + and the heal colour, a heal crit uses the heal crit colour, healing off records its
+reason, a `CRITICAL` flag drives the crit colour, size and animation on the reduced client, and
+numbers about you mount to the unit frame or the screen as the setting says. Damage to you is
+still dropped by default even when it arrives under a self-pointing alias. The test doubles for `SetCVar` and for `CombatText` model the real client:
+non-string values are rejected, a named CVar can be refused, and the frame only counts a number
+while it is registered.
+
+## [1.63] (2026-11-14)
+
+### Fixed: the page scrolled the wrong way
+
+A wheel-up notch moved the page down and a wheel-down notch moved it up. The offset sign was
+inverted; wheel-up now scrolls toward the top of the page.
+
+### Fixed: page content ran past the bottom of the window
+
+The page viewport is shorter than a page, and a plain frame does not clip its children, so rows
+drew straight over the window edge and into the game world. Every page viewport now clips its
+content (`SetClipsChildren`), so a row that does not fit is cut at the viewport edge instead of
+escaping the window.
+
+### Fixed: the window called a Forever client "Classic"
+
+`isForever` and `isMidnight` were file locals and were never published on the addon table, so
+`clientLabel()` fell through to "Classic" and any UI-side client decision was made with nil. Both
+are exported now. The combat path and the CVar branch were unaffected - they use the locals - but
+the header, the footer and the dashboard tiles were wrong on the client this addon exists for.
+
+### Scrollbar
+
+The gutter was 3px of near-invisible line on a dark surface. It is 4px with a visible track, a
+32px minimum thumb and the same clamped travel.
+
+### Visual
+
+Toggle and select labels are centred on the same line as their control, instead of hugging the
+top of the row while the switch or value button sits 12px lower.
+
+### Guard: no shared font objects
+
+The window and the render path set fonts per region only, never on a Blizzard font object
+(`GameFontNormal:SetFont`) and never by assigning `STANDARD_TEXT_FONT`. Writing either repaints
+every frame in the client that shares it - action bars, chat, tooltips. A static pin now fails
+the build if such a write appears in any source file, red-proved by adding a dead branch that
+does it.
+
+### Tests
+
+189 checks (was 182): the client identity is exported and the window labels it "Forever", every
+page viewport clips, a wheel-down notch moves the content down while wheel-up returns it, and
+no source line writes a shared font object.
+
 ## [1.62] (2026-11-14)
 
 ### Settings window: 1200x800, scaled to fit

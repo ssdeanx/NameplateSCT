@@ -49,18 +49,14 @@ local CLEU_ONLY = {
 	personalOnly = true,
 	showAbsorbDamage = true,
 	shouldDisplayOverkill = true,
-	useCritColor = true,
-	critColor = true,
-	["sizing.crits"] = true,
-	["sizing.critsScale"] = true,
-	["sizing.autoattackcritsizing"] = true,
+	-- Pet damage is identifiable only in the combat log: UNIT_COMBAT reports the victim and
+	-- the action, never the source.
+	showPetDamage = true,
+	-- Everything that needs the amount itself stays combat-log only: a secret amount cannot be
+	-- compared, averaged or split.
 	["sizing.smallHits"] = true,
 	["sizing.smallHitsHide"] = true,
 	["sizing.smallHitsScale"] = true,
-	["animations.crit"] = true,
-	["animations.autoattack"] = true,
-	["animations.autoattackcrit"] = true,
-	["animationsPersonal.crit"] = true,
 }
 NS.cleuOnlySettings = CLEU_ONLY
 
@@ -147,6 +143,13 @@ end
 --- Screen areas only exist in screen mode.
 local function screenMode()
 	return function() return GetPath("displayMode") == "screen" end
+end
+
+--- The heal crit colour only matters while healing is drawn and the crit colour is on.
+local function healCritColor()
+	return function()
+		return GetPath("showHealing") and GetPath("useHealCritColor") and true or false
+	end
 end
 
 -- A gated row says in its own label why it is not available.
@@ -352,6 +355,11 @@ local FLAG_OPTIONS = {
 	{ value = "", text = "Plain" },
 }
 
+local PERSONAL_ANCHOR_OPTIONS = {
+	{ value = "screen", text = "Screen area" },
+	{ value = "unitframe", text = "Your unit frame" },
+}
+
 local ICON_POSITION_OPTIONS = {
 	{ value = "LEFT", text = "Left" },
 	{ value = "RIGHT", text = "Right" },
@@ -509,10 +517,17 @@ local function buildDashboard(content)
 				local d = diagnostics()
 				local pools, active = 0, 0
 				if NS.GetPoolStats then pools, active = NS:GetPoolStats() end
-				local message = ("NameplateSCT %s | %s | mode=%s | source=%s | events=%d drawn=%d dropped=%d | secret=%d refused=%d | pool=%d/%d")
+				local steered, stillOn = 0, 0
+				if NS.GetBlizzardFCTState then steered, stillOn = NS:GetBlizzardFCTState() end
+				local fct = "?"
+				if NS.GetBlizzardFCTStatus then
+					local stopped, reason = NS:GetBlizzardFCTStatus()
+					fct = stopped and "off" or ("on: " .. tostring(reason))
+				end
+				local message = ("NameplateSCT %s | %s | mode=%s | source=%s | events=%d drawn=%d dropped=%d | secret=%d refused=%d | pool=%d/%d | fct=%s | fctvars=%d/%d")
 					:format(addonVersion(), clientLabel(), tostring(GetPath("displayMode")),
 						tostring(d.path or "?"), d.events or 0, d.drawn or 0, droppedTotal(),
-						d.secret or 0, d.refused or 0, active, pools)
+						d.secret or 0, d.refused or 0, active, pools, fct, stillOn, steered)
 				if NS.Print then NS:Print(message) end
 				if db() then db().lastDiagnostics = message end
 				NS:SetStatus("Diagnostic line printed to chat.", "good")
@@ -530,7 +545,7 @@ local function buildDashboard(content)
 	-- Diagnostics: checks on the left, counters on the right -----------------
 	y = section(content, y, "DIAGNOSTICS")
 
-	local cardHeight = 180
+	local cardHeight = 204
 	local checksWidth = 524
 
 	local checksCard = CreateFrame("Frame", nil, content)
@@ -582,15 +597,41 @@ local function buildDashboard(content)
 		},
 		{
 			label = "Blizzard text not doubling up",
-			hint = "turn on Hide Blizzard's own numbers",
-			pass = function()
-				local cvar = NS.blizzardCVar
+			hint = function()
+				local state = NS.diagnostics or {}
+				if (state.fctFailed or 0) > 0 then
+					return "this client refused the CVar change"
+				end
 				local profile = db()
-				if not cvar or not profile then return true end
-				if not profile.hideBlizzardFCT then return true end
-				local value = GetCVar and GetCVar(cvar)
-				if value == nil then return true end
-				return value == "0"
+				if not profile or not profile.hideBlizzardFCT then
+					return "turn on Hide Blizzard's own numbers"
+				end
+				if NS.GetBlizzardFCTStatus then
+					local stopped, reason = NS:GetBlizzardFCTStatus()
+					if not stopped and reason then return reason end
+				end
+				return "reload the UI"
+			end,
+			pass = function()
+				local profile = db()
+				if not profile or not profile.hideBlizzardFCT then return true end
+				-- Read the client's own state, not the CVar we wrote: the whole 1.64 failure was
+				-- a green check over a client that was still drawing.
+				if not NS.GetBlizzardFCTStatus then return true end
+				local stopped = NS:GetBlizzardFCTStatus()
+				return stopped == true
+			end,
+		},
+		{
+			label = "No other addon drawing numbers",
+			hint = function()
+				local rivals = NS.GetNumberRivals and NS:GetNumberRivals() or {}
+				if #rivals == 0 then return "disable the other addon" end
+				return table.concat(rivals, ", ") .. " is also drawing"
+			end,
+			pass = function()
+				if not NS.GetNumberRivals then return true end
+				return #NS:GetNumberRivals() == 0
 			end,
 		},
 	}
@@ -676,7 +717,7 @@ local function buildDashboard(content)
 		NS:ApplyBlizzardFCT()
 	end)
 	rightY = toggle(rightColumn, rightY, "Hide Blizzard's own numbers", "hideBlizzardFCT",
-		"Turns off Blizzard's nameplate damage text so it cannot double up with ours",
+		"Turns off all of Blizzard's own floating combat text, healing included: this client has no per-category switch. Untick, or disable the addon, to hand your settings back",
 		function() NS:ApplyBlizzardFCT() end)
 
 	ROW_WIDTH = CONTENT_WIDTH
@@ -701,7 +742,9 @@ local function buildDashboard(content)
 			local passed = row.check.pass() and true or false
 			local color = passed and C.good or C.warningText
 			row.dot:SetColorTexture(color[1], color[2], color[3])
-			row.state:SetText(passed and "OK" or row.check.hint)
+			local hint = row.check.hint
+			if type(hint) == "function" then hint = hint() end
+			row.state:SetText(passed and "OK" or hint)
 			row.state:SetTextColor(color[1], color[2], color[3])
 		end
 
@@ -764,7 +807,7 @@ local function buildGeneral(content)
 	y = toggle(content, y, "Show text that is not on your target", "displayOffTargetText")
 	y = toggle(content, y, "Use a separate off-target look", "useOffTargetAppearance")
 	y = toggle(content, y, "Hide Blizzard's own numbers", "hideBlizzardFCT",
-		"Turns off Blizzard's nameplate damage text so it cannot double up with ours",
+		"Turns off all of Blizzard's own floating combat text, healing included: this client has no per-category switch. Untick, or disable the addon, to hand your settings back",
 		function() NS:ApplyBlizzardFCT() end)
 
 	y = section(content, y, "WHAT COUNTS")
@@ -773,6 +816,16 @@ local function buildGeneral(content)
 	y = toggle(content, y, "Only damage you deal or take", "personalOnly",
 		"Ignores damage other players do to your target", nil, usable("personalOnly"))
 	y = toggle(content, y, "Show misses and avoidance", "showMisses")
+
+	y = section(content, y, "KINDS OF HIT")
+	y = toggle(content, y, "Melee damage", "showMeleeDamage")
+	y = toggle(content, y, "Spell damage", "showSpellDamage")
+	y = toggle(content, y, "Ranged damage", "showRangedDamage")
+	y = toggle(content, y, "Damage over time", "showPeriodicDamage")
+	y = toggle(content, y, "Healing you and your target receive", "showHealing")
+	y = toggle(content, y, "Pet damage", "showPetDamage",
+		"Only the combat log names the source, so this switch does nothing on Forever", nil,
+		usable("showPetDamage"))
 	y = toggle(content, y, "Include absorbed amount", "showAbsorbDamage", nil, nil,
 		usable("showAbsorbDamage"))
 	y = toggle(content, y, "Show overkill amount", "shouldDisplayOverkill", nil, nil,
@@ -821,11 +874,11 @@ local function buildNumbers(content)
 
 	y = section(content, y, "SIZE MODIFIERS")
 
-	y = toggle(content, y, "Embiggen crits", "sizing.crits", nil, nil, usable("sizing.crits"))
+	y = toggle(content, y, "Embiggen crits", "sizing.crits", nil, nil, nil)
 	y = slider(content, y, "Crit scale", "sizing.critsScale", 1, 3, 0.05,
-		function(value) return ("%.2fx"):format(value) end, usable("sizing.critsScale"))
+		function(value) return ("%.2fx"):format(value) end, nil)
 	y = toggle(content, y, "Crit sizing for auto attacks", "sizing.autoattackcritsizing", nil, nil,
-		usable("sizing.autoattackcritsizing"))
+		nil)
 	y = toggle(content, y, "Embiggen misses", "sizing.miss")
 	y = slider(content, y, "Miss scale", "sizing.missScale", 1, 3, 0.05,
 		function(value) return ("%.2fx"):format(value) end, when("sizing.miss"))
@@ -949,7 +1002,7 @@ local function buildAppearance(content)
 	y = section(content, y, "COLOURS")
 
 	y = toggle(content, y, "Colour damage by school", "damageColor")
-	y = hexField(content, y, "Default colour (hex)", "defaultColor",
+	y = hexField(content, y, "Normal hit colour (hex)", "defaultColor",
 		function() return not GetPath("damageColor") end)
 	y = toggle(content, y, "Colour damage you take", "damageColorPersonal")
 	y = hexField(content, y, "Your damage taken (hex)", "defaultColorPersonal",
@@ -957,13 +1010,20 @@ local function buildAppearance(content)
 
 	y = section(content, y, "CRIT AND MISS COLOURS")
 
-	y = toggle(content, y, "Use a crit colour", "useCritColor", nil, nil, usable("useCritColor"))
-	y = hexField(content, y, "Crit colour (hex)", "critColor", usable("critColor"))
+	y = toggle(content, y, "Use a crit colour", "useCritColor", nil, nil, nil)
+	y = hexField(content, y, "Crit colour (hex)", "critColor", nil)
 	y = toggle(content, y, "Use a miss colour", "useMissColor")
 	y = hexField(content, y, "Miss colour (hex)", "missColor", when("useMissColor"))
 	y = toggle(content, y, "Use a miss colour on you", "useMissColorPersonal")
 	y = hexField(content, y, "Miss colour on you (hex)", "missColorPersonal",
 		when("useMissColorPersonal"))
+
+	y = section(content, y, "HEALING COLOURS")
+
+	y = hexField(content, y, "Heal colour (hex)", "healColor", when("showHealing"))
+	y = toggle(content, y, "Use a heal crit colour", "useHealCritColor", nil, nil,
+		when("showHealing"))
+	y = hexField(content, y, "Heal crit colour (hex)", "healCritColor", healCritColor())
 
 	return y
 end
@@ -979,19 +1039,24 @@ local function buildAnimations(content)
 	y = section(content, y, "OUTGOING")
 
 	y = select(content, y, "Ability hits", "animations.ability", options)
-	y = select(content, y, "Critical hits", "animations.crit", options, nil, usable("animations.crit"))
+	y = select(content, y, "Critical hits", "animations.crit", options, nil, nil)
 	y = select(content, y, "Auto attacks", "animations.autoattack", options, nil,
-		usable("animations.autoattack"))
+		nil)
 	y = select(content, y, "Auto attack crits", "animations.autoattackcrit", options, nil,
-		usable("animations.autoattackcrit"))
+		nil)
 	y = select(content, y, "Miss / dodge / parry", "animations.miss", options)
 
 	y = section(content, y, "ON YOU")
 
 	y = select(content, y, "Damage you take", "animationsPersonal.normal", options)
 	y = select(content, y, "Critical hits on you", "animationsPersonal.crit", options, nil,
-		usable("animationsPersonal.crit"))
+		nil)
 	y = select(content, y, "Misses on you", "animationsPersonal.miss", options)
+
+	y = section(content, y, "HEALING")
+
+	y = select(content, y, "Heals", "animations.heal", options)
+	y = select(content, y, "Heal crits", "animations.healCrit", options)
 
 	y = section(content, y, "TIMING")
 
@@ -1015,6 +1080,13 @@ local function buildPosition(content)
 
 	y = slider(content, y, "Horizontal", "xOffset", -300, 300, 1, function(value) return ("%d"):format(value) end)
 	y = slider(content, y, "Vertical", "yOffset", -300, 300, 1, function(value) return ("%d"):format(value) end)
+
+	y = section(content, y, "ON YOU")
+
+	y = select(content, y, "Where they are mounted", "personalAnchor", PERSONAL_ANCHOR_OPTIONS,
+		function()
+			if NS.RefreshScreenAnchors then NS:RefreshScreenAnchors() end
+		end)
 
 	y = section(content, y, "OFFSET ON YOU")
 
@@ -1546,7 +1618,7 @@ local function createFrame()
 	local version = addonVersion()
 	local subtitleText = clientLabel() .. "  ·  " .. sourceLabel() .. (version ~= "" and ("  ·  v" .. version) or "")
 	W.Text(titleBar, "NameplateSCT", 66, -12, nil, "semibold", 19, C.bright)
-	W.Text(titleBar, subtitleText, 66, -38, 500, "regular", 12, C.dim)
+	created.subtitle = W.Text(titleBar, subtitleText, 66, -38, 500, "regular", 12, C.dim)
 
 	local close = W.CloseButton(titleBar, function() created:Hide() end)
 	close:SetPoint("RIGHT", titleBar, "RIGHT", -14, 0)

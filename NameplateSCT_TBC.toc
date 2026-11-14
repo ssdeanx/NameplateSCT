@@ -1,11 +1,11 @@
 ﻿## Interface: 20505, 20506
-## Version: 1.62
+## Version: 1.64
 ## Title: NameplateSCT
 ## Author: AcidBomb
 ## SavedVariables: NameplateSCTDB
 ## Notes: Nameplate-based scrolling combat text.
 ## OptionalDeps: Ace3, LibEasing
-## IconTexture: Interface\\Addons\\NameplateSCT\\logo.tga
+## IconTexture: Interface\Addons\NameplateSCT\logo.tga
 ## X-Curse-Project-ID: 1792629
 ## X-Wago-ID: rN4VDxKD
 

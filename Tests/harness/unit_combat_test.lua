@@ -73,6 +73,7 @@ local function NewRegion(kind)
 	region.IsShown = function(self) return self._shown ~= false end
 	region.SetSize = function(self, w, h) self._w, self._h = w, h end
 	region.SetScale = function(self, value) self._scale = value end
+	region.SetClipsChildren = function(self, value) self._clipsChildren = value end
 	region.GetWidth = function(self) return self._w or 0 end
 	region.GetHeight = function(self) return self._h or 0 end
 	region.SetWidth = function(self, w) self._w = w end
@@ -224,12 +225,57 @@ function UnitGUID() return "Player-1-0000" end
 -- Tests can name one unit that is the player's target; everything else stays off-target.
 function UnitIsUnit(a, b)
 	if _G.__unitIsTarget and a == _G.__unitIsTarget and b == "target" then return true end
+	if _G.__unitIsSelf and a == _G.__unitIsSelf and b == "player" then return true end
 	return false
 end
 function UnitIsDead(unit) return false end
 function UnitExists() return true end
-function GetCVar() return "0" end
-function SetCVar() end
+-- CVars are a table now: the Blizzard combat-text family is steered, restored and checked by
+-- name, so a single stubbed answer cannot prove any of it.
+local cvarValues = { nameplateShowEnemies = "1" }
+function GetCVar(name) return cvarValues[name] end
+-- The client's binding takes a cstring and silently ignores anything else, and refuses
+-- read-only/secure CVars the same way. Both behaviours are modelled so a numeric write (the
+-- 1.63 bug) or an unverified write fails here instead of in game.
+function SetCVar(name, value)
+	if type(value) ~= "string" then return end
+	if _G.__refuseCvar == name then return end
+	cvarValues[name] = value
+end
+
+-- The client's actual combat-text renderer (Blizzard_CombatText, LoadOnDemand). This is the
+-- piece 1.64 was missing: CombatTextTypeInfo gives DAMAGE, DAMAGE_CRIT, SPELL_DAMAGE and the
+-- HEAL entries `show = 1` with no cvar, so no per-category CVar is ever consulted for them.
+-- The only switch is the event registration driven by `enableFloatingCombatText`:
+--
+--   CombatText:OnLoad()  -> CombatTextUtil.UpdateEventRegistration(self, GetCVarBool(master))
+--   settings callback    -> same call when the master flips
+--
+-- so the stub models exactly that: a frame that only draws when it is registered.
+local combatTextFrame = { events = {} }
+function combatTextFrame:RegisterEvent(name) self.events[name] = true end
+function combatTextFrame:UnregisterEvent(name) self.events[name] = nil end
+function combatTextFrame:UnregisterAllEvents() self.events = {} end
+function combatTextFrame:IsEventRegistered(name) return self.events[name] and true or false end
+function combatTextFrame:IsVisible() return true end
+function combatTextFrame:UpdateDisplayedMessages() self.refreshes = (self.refreshes or 0) + 1 end
+function combatTextFrame:OnEvent(event)
+	if not self.events[event] then return end
+	_G.__blizzardNumbers = (_G.__blizzardNumbers or 0) + 1
+end
+_G.CombatText = combatTextFrame
+CombatTextUtil = {
+	UpdateEventRegistration = function(frame, enable)
+		if enable then
+			frame:RegisterEvent("COMBAT_TEXT_UPDATE")
+		else
+			frame:UnregisterEvent("COMBAT_TEXT_UPDATE")
+		end
+	end,
+}
+function CombatText_UpdateDisplayedMessages() combatTextFrame:UpdateDisplayedMessages() end
+-- One tick of the client's own combat text. Counts a number only while the frame is registered.
+function _G.__drawBlizzardText() combatTextFrame:OnEvent("COMBAT_TEXT_UPDATE") end
 
 -- Provided by AceGUI-3.0-SharedMediaWidgets at runtime; the AceConfig page table
 -- dereferences it while the file loads.
@@ -409,7 +455,15 @@ end
 ok(rendered ~= nil, "a FontString received text")
 ok(type(rendered) == "string" and rendered:find("1%.2k") ~= nil,
 	"the amount reached the screen abbreviated by default", tostring(rendered))
-ok(rendered and rendered:find("|Cff") ~= nil, "the number carries a colour code", tostring(rendered))
+ok(rendered and rendered:find("|Cff") == nil,
+	"the text stays plain: colour is a FontString property, not an inline code", tostring(rendered))
+local coloured
+for _, fs in ipairs(createdFontStrings) do
+	if fs._text ~= nil and fs._text ~= "" then coloured = fs._textColor break end
+end
+ok(type(coloured) == "table" and type(coloured[1]) == "number" and type(coloured[2]) == "number"
+	and type(coloured[3]) == "number", "the number carries its colour on the FontString",
+	coloured and tostring(coloured[1]))
 
 -- Same hit with full-number styling must render the grouped digits.
 NS.db.profile.truncateMethod = "NONE"
@@ -471,16 +525,176 @@ end
 ok(missText ~= nil and missText:find("Dodged") ~= nil, "a dodge renders as text", tostring(missText))
 
 --------------------------------------------------------------------------------
--- Healing and unknown actions are ignored
+-- Healing is drawn, in its own colour, and can be switched off
 --------------------------------------------------------------------------------
 
+NS.db.profile.showHealing = true
 NS.diagnostics.drawn = 0
+createdFontStrings = {}
 _G.__now = 400
 FireEvent("UNIT_COMBAT", "nameplate1", "HEAL", "", 55, 0)
-eq(NS.diagnostics.drawn, 0, "healing is not drawn by this addon")
+eq(NS.diagnostics.drawn, 1, "healing is drawn")
 
+local healText, healColor
+for _, fs in ipairs(createdFontStrings) do
+	if fs._text ~= nil and fs._text ~= "" then healText, healColor = fs._text, fs._textColor break end
+end
+ok(healText == "+55", "a heal is prefixed with +", tostring(healText))
+ok(type(healColor) == "table" and healColor[2] > healColor[1] and healColor[2] > healColor[3],
+	"a heal is green by default", healColor and tostring(healColor[2]))
+
+-- The crit heal colour is a setting of its own.
+NS.db.profile.useHealCritColor = true
+NS.db.profile.healCritColor = "3366ff"
+createdFontStrings = {}
+_G.__now = 401
+FireEvent("UNIT_COMBAT", "nameplate1", "HEAL", "CRITICAL", 90, 0)
+local critHealColor
+for _, fs in ipairs(createdFontStrings) do
+	if fs._text ~= nil and fs._text ~= "" then critHealColor = fs._textColor break end
+end
+ok(type(critHealColor) == "table" and critHealColor[3] > critHealColor[2],
+	"a heal crit uses the heal crit colour", critHealColor and tostring(critHealColor[3]))
+NS.db.profile.useHealCritColor = false
+
+-- And it can be switched off entirely.
+NS.db.profile.showHealing = false
+NS.diagnostics.drawn = 0
+_G.__now = 402
+FireEvent("UNIT_COMBAT", "nameplate1", "HEAL", "", 55, 0)
+eq(NS.diagnostics.drawn, 0, "healing is off when the switch is off")
+eq(NS.diagnostics.lastDrop, "healing is off", "and it says why")
+NS.db.profile.showHealing = true
+
+NS.diagnostics.drawn = 0
 FireEvent("UNIT_COMBAT", "nameplate1", "NONSENSE_ACTION", "", 55, 0)
 eq(NS.diagnostics.drawn, 0, "an unknown action is ignored")
+
+--------------------------------------------------------------------------------
+-- Every kind of hit has its own switch
+--------------------------------------------------------------------------------
+
+local categories = {
+	{ action = "WOUND", key = "showMeleeDamage" },
+	{ action = "SPELL", key = "showSpellDamage" },
+	{ action = "RANGE", key = "showRangedDamage" },
+	{ action = "PERIODIC", key = "showPeriodicDamage" },
+}
+
+for _, case in ipairs(categories) do
+	local saved = NS.db.profile[case.key]
+	NS.db.profile[case.key] = false
+	NS.diagnostics.drawn = 0
+	_G.__now = _G.__now + 1
+	FireEvent("UNIT_COMBAT", "nameplate1", case.action, "", 100, SCHOOL_MASK_FIRE)
+	eq(NS.diagnostics.drawn, 0, case.action .. " is off when " .. case.key .. " is off")
+	eq(NS.diagnostics.lastDrop, "that kind of damage is off", "the drop reason names the category")
+
+	NS.db.profile[case.key] = true
+	_G.__now = _G.__now + 1
+	FireEvent("UNIT_COMBAT", "nameplate1", case.action, "", 100, SCHOOL_MASK_FIRE)
+	eq(NS.diagnostics.drawn, 1, case.action .. " draws again when " .. case.key .. " is on")
+	NS.db.profile[case.key] = saved
+end
+
+-- Pet damage has no source on this client, but the combat-log path can gate it.
+NS.db.profile.showPetDamage = false
+local petBefore = NS.diagnostics.dropped["pet damage is off"] or 0
+NS:DamageEvent("Creature-0-1-2-3-4", "pet", 100, 0, SCHOOL_MASK_PHYSICAL, false, nil, 0, nil, true)
+eq((NS.diagnostics.dropped["pet damage is off"] or 0), petBefore + 1, "pet damage is gated where it can be told apart")
+NS.db.profile.showPetDamage = true
+
+-- A combat-log category reaches DamageEvent directly.
+NS.db.profile.showRangedDamage = false
+local rangedBefore = NS.diagnostics.dropped["that kind of damage is off"] or 0
+NS:DamageEvent("Creature-0-1-2-3-4", "Auto Shot", 100, 0, SCHOOL_MASK_PHYSICAL, false, nil, 0, "showRangedDamage")
+eq((NS.diagnostics.dropped["that kind of damage is off"] or 0), rangedBefore + 1,
+	"a combat-log hit is gated by its category")
+NS.db.profile.showRangedDamage = true
+
+--------------------------------------------------------------------------------
+-- Crits: UNIT_COMBAT carries the flag Blizzard's own combat feedback reads, so a crit
+-- gets its own colour, size and animation on the restricted client too.
+--------------------------------------------------------------------------------
+
+-- The crit colour is a plain lookup, so it can be proved without an event.
+NS.db.profile.useCritColor = true
+NS.db.profile.critColor = "ff00ff"
+local cr, cg, cb = NS:GetTextColor(false, SCHOOL_MASK_FIRE, nil, true)
+eq(math.floor(cr * 255 + 0.5), 255, "the crit colour wins over the school colour")
+eq(math.floor(cg * 255 + 0.5), 0, "the crit colour's green channel is applied")
+eq(math.floor(cb * 255 + 0.5), 255, "the crit colour's blue channel is applied")
+
+-- And an event with the CRITICAL flag uses it, plus the crit sizing and animation.
+NS.db.profile.animations.crit = "fountain"
+NS.db.profile.sizing.crits = true
+NS.db.profile.sizing.critsScale = 2
+_G.__now = _G.__now + 1
+createdFontStrings = {}
+FireEvent("UNIT_COMBAT", "nameplate1", "SPELL", "CRITICAL", 200, SCHOOL_MASK_FIRE)
+local critFontString = _G.__lastNumberFontString
+ok(critFontString ~= nil, "a crit draws")
+eq(critFontString and critFontString.animation, "fountain", "a crit uses the crit animation")
+-- The plate is off-target, so the off-target size is the base the crit scale multiplies.
+local critBase = NS.db.profile.useOffTargetAppearance
+	and NS.db.profile.offTargetFormatting.size or NS.db.profile.formatting.size
+eq(critFontString and critFontString.NSCTFontSize, critBase * NS.db.profile.sizing.critsScale,
+	"a crit is enlarged by the crit scale")
+ok(critFontString and critFontString._textColor and critFontString._textColor[1] > 0.9
+	and critFontString._textColor[3] > 0.9, "a crit uses the crit colour",
+	critFontString and critFontString._textColor and tostring(critFontString._textColor[1]))
+
+-- A plain hit keeps the normal animation and colour.
+NS.db.profile.animations.ability = "rainfall"
+_G.__now = _G.__now + 1
+createdFontStrings = {}
+FireEvent("UNIT_COMBAT", "nameplate1", "SPELL", "", 200, SCHOOL_MASK_FIRE)
+local plainFontString = _G.__lastNumberFontString
+eq(plainFontString and plainFontString.animation, "rainfall", "a normal hit uses the normal animation")
+ok(plainFontString and plainFontString._textColor
+	and (plainFontString._textColor[1] ~= critFontString._textColor[1]
+		or plainFontString._textColor[3] ~= critFontString._textColor[3]),
+	"a normal hit is not coloured like a crit")
+NS.db.profile.useCritColor = false
+NS.db.profile.sizing.critsScale = 1.5
+
+--------------------------------------------------------------------------------
+-- Numbers about you mount where the setting says
+--------------------------------------------------------------------------------
+
+NS.db.profile.personal = true
+NS.db.profile.displayMode = "nameplates"
+
+_G.PlayerFrame = { IsShown = function() return true end }
+NS.db.profile.personalAnchor = "unitframe"
+_G.__now = _G.__now + 1
+createdFontStrings = {}
+FireEvent("UNIT_COMBAT", "player", "WOUND", "", 100, SCHOOL_MASK_FIRE)
+local unitFrameNumber = _G.__lastNumberFontString
+ok(unitFrameNumber ~= nil, "damage on you draws")
+ok(unitFrameNumber and unitFrameNumber.anchorFrame == _G.PlayerFrame,
+	"damage on you is mounted to your unit frame")
+
+NS.db.profile.personalAnchor = "screen"
+_G.__now = _G.__now + 1
+createdFontStrings = {}
+FireEvent("UNIT_COMBAT", "player", "WOUND", "", 100, SCHOOL_MASK_FIRE)
+local screenNumber = _G.__lastNumberFontString
+ok(screenNumber and screenNumber.anchorFrame == UIParent,
+	"and to the screen when that is the choice")
+
+-- A unit frame the client is not showing falls back to the screen instead of dropping it.
+_G.PlayerFrame = { IsShown = function() return false end }
+NS.db.profile.personalAnchor = "unitframe"
+_G.__now = _G.__now + 1
+createdFontStrings = {}
+FireEvent("UNIT_COMBAT", "player", "WOUND", "", 100, SCHOOL_MASK_FIRE)
+local fallbackNumber = _G.__lastNumberFontString
+ok(fallbackNumber and fallbackNumber.anchorFrame == UIParent,
+	"a hidden unit frame falls back to the screen")
+_G.PlayerFrame = nil
+NS.db.profile.personalAnchor = "screen"
+NS.db.profile.personal = false
 
 --------------------------------------------------------------------------------
 -- A plate-less unit token is ignored rather than raising
@@ -764,6 +978,36 @@ local source = handle and handle:read("*a")
 if handle then handle:close() end
 
 ok(source ~= nil, "addon source readable for the static pins")
+
+-- Fonts are set per region, never on a shared Blizzard font object. Writing
+-- GameFontNormal/GameFontHighlight (or STANDARD_TEXT_FONT) would repaint every frame in the
+-- client that shares it - action bars, chat, tooltips - which is the "the addon changed my
+-- UI font" class of bug. The bundled Source Sans files are only ever passed to
+-- CreateFontString/SetFont on regions this addon owns.
+local widgetsHandle = io.open(addonDir .. "Options/Widgets.lua", "r")
+local widgetsText = widgetsHandle and widgetsHandle:read("*a")
+if widgetsHandle then widgetsHandle:close() end
+
+local function globalFontWrites(text)
+	local found = {}
+	for line in (text or ""):gmatch("[^\n]+") do
+		local code = line:gsub("%-%-.*$", "")
+		if code:find("GameFont[%w_]*%s*:SetFont") or code:find("GameFont[%w_]*%.font%s*=")
+			or code:find("STANDARD_TEXT_FONT%s*=") or code:find("ChatFont[%w_]*%s*:SetFont") then
+			found[#found + 1] = line
+		end
+	end
+	return found
+end
+
+local fontViolations = {}
+for _, text in ipairs({ source, settingsText, widgetsText }) do
+	for _, line in ipairs(globalFontWrites(text)) do
+		fontViolations[#fontViolations + 1] = line
+	end
+end
+ok(#fontViolations == 0, "nothing writes a shared Blizzard font object",
+	#fontViolations > 0 and table.concat(fontViolations, " | ") or nil)
 ok(source and source:find("safeUnitIsDead") ~= nil, "the death check goes through a throw-aware helper")
 ok(source and source:find("(not UnitIsDead%(") == nil, "no bare UnitIsDead call remains in the render loop")
 ok(source and source:find("UnitHealth") == nil, "no UnitHealth read (health is a secret number)")
@@ -873,6 +1117,228 @@ end
 
 _G.__stringHeight = nil
 
+
+
+
+-- Damage to you must stay off by default, even when the client reports it under an alias that
+-- points at you ("targettarget" while a mob is hitting you) instead of the "player" token.
+NS.db.profile.displayMode = "screen"
+NS.db.profile.personal = false
+_G.__unitIsSelf = "targettarget"
+_G.__now = 1450
+NS.diagnostics.drawn = 0
+createdFontStrings = {}
+local selfDropsBefore = NS.diagnostics.dropped["damage you take is off"] or 0
+
+FireEvent("UNIT_COMBAT", "targettarget", "WOUND", "", 42, SCHOOL_MASK_FIRE)
+eq(NS.diagnostics.drawn, 0, "damage to you is not drawn by default, even under an alias")
+ok((NS.diagnostics.dropped["damage you take is off"] or 0) == selfDropsBefore + 1,
+	"the alias is recorded as damage you take")
+
+-- With the setting on it is drawn once, on the personal side.
+NS.db.profile.personal = true
+NS.db.profile.displayMode = "nameplates"
+_G.__now = 1452
+NS.diagnostics.drawn = 0
+createdFontStrings = {}
+FireEvent("UNIT_COMBAT", "targettarget", "WOUND", "", 43, SCHOOL_MASK_FIRE)
+eq(NS.diagnostics.drawn, 1, "with the setting on, damage to you is drawn")
+local selfNumber = _G.__lastNumberFontString
+ok(selfNumber and selfNumber.unit == "player",
+	"an alias that points at you is treated as the player", selfNumber and selfNumber.unit)
+
+NS.db.profile.personal = false
+_G.__unitIsSelf = nil
+NS.db.profile.displayMode = "nameplates"
+
+--------------------------------------------------------------------------------
+-- Blizzard combat text: the master switch gates the renderer, the family CVars are the
+-- classic-family defence. Reading back our own CVar is not proof - the client is.
+--------------------------------------------------------------------------------
+
+local family = NS.blizzardTextCVars or {}
+local master = NS.blizzardFCTMasterCVar
+eq(type(master), "string", "the master combat-text switch has a name")
+eq(#family, 4, "the addon steers the damage/avoidance family")
+
+-- Start from the state the user reported: Blizzard's numbers are drawing.
+_G.CombatText.events = { COMBAT_TEXT_UPDATE = true }
+for _, name in ipairs(family) do cvarValues[name] = "1" end
+cvarValues[master] = "1"
+
+NS.db.profile.hideBlizzardFCT = true
+NS:ApplyBlizzardFCT()
+
+eq(cvarValues[master], "0", "the master switch this client actually reads is turned off")
+eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), false,
+	"the client's renderer is unregistered, which is what stops damage and healing text")
+
+_G.__blizzardNumbers = 0
+_G.__drawBlizzardText()
+eq(_G.__blizzardNumbers, 0, "a combat-text tick draws nothing once the setting is on")
+eq((NS:GetBlizzardFCTStatus()), true, "the dashboard status reads the client, not our write")
+
+-- The 1.64 bug, exactly: every CVar reads "0" and the client keeps drawing. A check that trusts
+-- the CVar goes green here; one that asks the client does not.
+for _, name in ipairs(family) do cvarValues[name] = "0" end
+_G.CombatText.events = { COMBAT_TEXT_UPDATE = true }
+eq((NS:GetBlizzardFCTStatus()), false, "a green CVar does not mean the client stopped")
+_G.__blizzardNumbers = 0
+_G.__drawBlizzardText()
+eq(_G.__blizzardNumbers, 1, "and the numbers really do still come through")
+
+-- The addon's own pass re-asserts the registration, so the fix does not depend on the client's
+-- settings callback having fired.
+NS:ApplyBlizzardFCT()
+eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), false, "re-applying unregisters the renderer")
+_G.__blizzardNumbers = 0
+_G.__drawBlizzardText()
+eq(_G.__blizzardNumbers, 0, "numbers stop again")
+
+local steered, on = NS:GetBlizzardFCTState()
+eq(steered, 5, "the state helper sees the master plus the whole family")
+eq(on, 0, "the state helper reports nothing still drawing")
+
+-- Toggling the setting back off restores what the player had, and gives the text back.
+NS.db.profile.hideBlizzardFCT = false
+NS:ApplyBlizzardFCT()
+eq(cvarValues[master], "1", "the master switch is handed back to the player")
+local restored = 0
+for _, name in ipairs(family) do
+	if cvarValues[name] == "1" then restored = restored + 1 end
+end
+eq(restored, 4, "turning the setting off restores Blizzard's text")
+eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), true, "the client's renderer is registered again")
+_G.__blizzardNumbers = 0
+_G.__drawBlizzardText()
+eq(_G.__blizzardNumbers, 1, "Blizzard's numbers come back when the setting is off")
+
+-- A CVar this client does not have is skipped, not treated as a refused write.
+NS.db.profile.hideBlizzardFCT = true
+NS:ApplyBlizzardFCT()
+cvarValues[family[4]] = nil
+local steeredWithout = select(1, NS:GetBlizzardFCTState())
+eq(steeredWithout, 4, "a CVar the client does not expose is not counted")
+eq(NS.diagnostics.fctFailed, 0, "an absent CVar is not a failure")
+
+-- And nothing outside the switch is touched.
+eq(cvarValues.nameplateShowEnemies, "1", "unrelated CVars are left alone")
+
+-- A CVar the client refuses to change is reported, not silently assumed to have worked.
+for _, name in ipairs(family) do cvarValues[name] = "1" end
+NS.db.profile.hideBlizzardFCT = false
+NS:ApplyBlizzardFCT()
+_G.__refuseCvar = family[1]
+NS.db.profile.hideBlizzardFCT = true
+NS:ApplyBlizzardFCT()
+eq(cvarValues[family[1]], "1", "a refused CVar keeps its value")
+eq(cvarValues[family[2]], "0", "the other CVars are still written")
+eq(NS.diagnostics.fctFailed, 1, "the refused write is counted")
+eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), false,
+	"even a refused CVar leaves the renderer unregistered this session")
+_G.__refuseCvar = nil
+
+NS.db.profile.hideBlizzardFCT = false
+NS:ApplyBlizzardFCT()
+eq(NS.diagnostics.fctFailed, 0, "a successful pass clears the failure count")
+
+-- The record that makes "show" possible is per session. A reload between "hide" and "show"
+-- leaves the switch reading "0" with nothing to hand back, so the addon must never record "0"
+-- as the value to restore: it records the client's default instead and the text always returns.
+cvarValues[master] = "0"
+NS.db.profile.hideBlizzardFCT = true
+NS:ApplyBlizzardFCT()
+NS.db.profile.hideBlizzardFCT = false
+NS:ApplyBlizzardFCT()
+eq(cvarValues[master], "1", "a record lost to a reload still hands Blizzard's text back")
+eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), true, "and the renderer comes back")
+
+-- With the setting off and nothing recorded, the player's own choice is left alone: a player
+-- who turned the client's combat text off in the game's options must stay off.
+cvarValues[master] = "0"
+_G.CombatText.events = {}
+NS.db.profile.hideBlizzardFCT = false
+NS:ApplyBlizzardFCT()
+eq(cvarValues[master], "0", "an untouched client setting is not turned on behind the player")
+_G.CombatText.events = { COMBAT_TEXT_UPDATE = true }
+
+-- Turning the addon itself off hands Blizzard's text back: drawing nothing while muting the
+-- client would leave the player with no numbers at all.
+NS.db.profile.hideBlizzardFCT = true
+NS.db.profile.enabled = true
+NS:ApplyBlizzardFCT()
+eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), false, "hidden while the addon is on")
+NS.db.profile.enabled = false
+NS:ApplyBlizzardFCT()
+eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), true, "the renderer returns with the addon off")
+eq(cvarValues[master], "1", "the master switch is handed back with the addon off")
+NS.db.profile.enabled = true
+NS:ApplyBlizzardFCT()
+eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), false, "and is muted again when the addon is back on")
+NS.db.profile.hideBlizzardFCT = false
+NS:ApplyBlizzardFCT()
+
+-- The setting stays authoritative: if the game's own options turn Blizzard's text back on
+-- while the toggle is on, the addon puts it back instead of letting the player see numbers
+-- return and think the setting broke.
+NS.db.profile.hideBlizzardFCT = true
+NS.db.profile.enabled = true
+NS:ApplyBlizzardFCT()
+eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), false, "hidden to start")
+cvarValues[master] = "1"
+_G.CombatText.events = { COMBAT_TEXT_UPDATE = true }
+FireEvent("CVAR_UPDATE", master)
+eq(cvarValues[master], "0", "the master switch is put back")
+eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), false, "and the renderer is unregistered again")
+
+-- The echo of our own write does not cause a second pass.
+_G.CombatText.events = {}
+FireEvent("CVAR_UPDATE", master)
+eq(cvarValues[master], "0", "our own write's event is left alone")
+
+-- An unrelated CVar does not trigger a re-apply.
+cvarValues[master] = "1"
+_G.CombatText.events = { COMBAT_TEXT_UPDATE = true }
+FireEvent("CVAR_UPDATE", "nameplateShowEnemies")
+eq(cvarValues[master], "1", "an unrelated CVar change is ignored")
+
+NS.db.profile.hideBlizzardFCT = false
+NS:ApplyBlizzardFCT()
+
+-- Another addon drawing numbers in the same place is named, so "I turned Blizzard's off and it
+-- still shows" has a cause instead of another guessing round.
+_G.C_AddOns = { IsAddOnLoaded = function(name) return name == "PlateSCT" end }
+local rivals = NS:GetNumberRivals()
+eq(#rivals, 1, "a loaded number addon is reported")
+eq(rivals[1], "PlateSCT", "and it is named")
+rivals[#rivals + 1] = "leaked"
+eq(#NS:GetNumberRivals(), 1, "each call returns a fresh list")
+_G.C_AddOns = { IsAddOnLoaded = function() return false end }
+eq(#NS:GetNumberRivals(), 0, "nothing is reported when no rival is loaded")
+_G.C_AddOns = nil
+eq(#NS:GetNumberRivals(), 0, "a client without the addon API reports nothing")
+
+--------------------------------------------------------------------------------
+-- Spell icons are off by default, including for a profile saved by an older build
+--------------------------------------------------------------------------------
+
+eq(NS.defaults.profile.showIcon, false, "spell icons are off by default")
+
+-- A profile saved before the change still carries showIcon = true, so the new default only
+-- reaches it through a one-time correction recorded on the saved variable.
+_G.NameplateSCTDB.iconDefaultOff = nil
+NS.db.profile.showIcon = true
+local defaultsChanged = NS.applyDefaultChanges(NS.db, "NameplateSCTDB")
+eq(defaultsChanged, true, "an existing profile is moved to the new default once")
+eq(NS.db.profile.showIcon, false, "spell icons are off after the correction")
+eq(_G.NameplateSCTDB.iconDefaultOff, true, "the correction is recorded on the saved variable")
+
+-- Turning them back on is the player's choice and must survive a reload.
+NS.db.profile.showIcon = true
+eq(NS.applyDefaultChanges(NS.db, "NameplateSCTDB"), false, "the correction does not run twice")
+eq(NS.db.profile.showIcon, true, "a player who turns icons back on keeps them")
+NS.db.profile.showIcon = false
+NS:RefreshSettings()
 
 --------------------------------------------------------------------------------
 -- Configurable shadow: a second FontString, because the client's own shadow is a fixed
@@ -1030,10 +1496,12 @@ eq((d.dropped["under the damage threshold"] or 0), dropsBefore + 1, "a hit under
 eq(d.lastDrop, "under the damage threshold", "the last drop reason is remembered")
 NS.db.profile.minDamage = 0
 
-local healBefore = d.dropped["healing"] or 0
+local healBefore = d.dropped["healing is off"] or 0
+NS.db.profile.showHealing = false
 _G.__now = 1501
 FireEvent("UNIT_COMBAT", "nameplate1", "HEAL", "", 10, 0)
-ok((d.dropped["healing"] or 0) > healBefore, "healing is counted as dropped")
+ok((d.dropped["healing is off"] or 0) > healBefore, "a heal is counted as dropped when healing is off")
+NS.db.profile.showHealing = true
 
 local pooled, active = NS:GetPoolStats()
 ok(type(pooled) == "number" and type(active) == "number", "pool statistics are readable")
@@ -1101,6 +1569,10 @@ local function openMenus()
 	end
 	return count
 end
+
+ok(NS.isForever == true, "the client identity is exported for the window to label")
+ok(uiFrame.subtitle and tostring(uiFrame.subtitle._text):find("Forever", 1, true) ~= nil,
+	"the window labels this client as Forever, not Classic", uiFrame.subtitle and uiFrame.subtitle._text)
 
 eq(uiFrame:GetWidth(), 1200, "the window is 1200 wide")
 eq(uiFrame:GetHeight(), 800, "the window is 800 tall")
@@ -1393,6 +1865,32 @@ NS.db.profile.useMissColor = false
 -- The footer reports state, which is where a rejected value is explained.
 NS:SetStatus("check the field", "warning")
 eq(settingsFrame.statusText._text, "check the field", "the footer reports a message")
+
+-- Pages are taller than their viewport: without clipping the rows would draw over the
+-- bottom edge of the window, which is exactly what the first in-game screenshot showed.
+local unclipped = {}
+for pageId, viewport in pairs(uiFrame.pages or {}) do
+	if viewport._clipsChildren ~= true then unclipped[#unclipped + 1] = pageId end
+end
+ok(#unclipped == 0, "every page clips its content to the viewport",
+	#unclipped > 0 and table.concat(unclipped, ", ") or nil)
+
+-- Wheel direction: a wheel-down notch scrolls down (content moves up), wheel-up returns.
+local generalPage = uiFrame.pages and uiFrame.pages.general
+ok(generalPage ~= nil and generalPage._scripts and generalPage._scripts.OnMouseWheel ~= nil,
+	"the page viewport handles the wheel")
+if generalPage and generalPage._scripts and generalPage._scripts.OnMouseWheel then
+	generalPage:SetContentHeight(2000)
+	generalPage._scripts.OnMouseWheel(generalPage, -1)
+	ok(generalPage.content._point and generalPage.content._point[3] == 60,
+		"a wheel-down notch scrolls down", generalPage.content._point and generalPage.content._point[3])
+
+	generalPage._scripts.OnMouseWheel(generalPage, 1)
+	ok(generalPage.content._point and generalPage.content._point[3] == 0,
+		"a wheel-up notch scrolls back toward the top", generalPage.content._point and generalPage.content._point[3])
+	generalPage:ResetScroll()
+	generalPage:SetContentHeight(0)
+end
 
 -- The Appearance page previews the number with the live styling, so the shadow can be
 -- tuned by looking at it instead of guessing.

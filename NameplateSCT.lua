@@ -33,6 +33,48 @@ local isModernCvar = isMidnight or isForever
 local blizzardCvar = isModernCvar and "floatingCombatTextCombatDamage_v2" or "floatingCombatTextCombatDamage"
 NameplateSCT.blizzardCVar = blizzardCvar
 
+-- How the client actually decides to draw its own combat text (wow-ui-source, origin/forever,
+-- Blizzard_CombatText/Shared):
+--
+--   CombatTextTypeInfo.DAMAGE       = { show = 1 }        -- no cvar at all
+--   CombatTextTypeInfo.SPELL_DAMAGE = { show = 1 }        -- no cvar at all
+--   CombatTextTypeInfo.HEAL         = { show = 1 }        -- no cvar at all
+--   CombatTextTypeInfo.MISS         = { cvar = "floatingCombatTextDodgeParryMiss_v2" }
+--
+-- Damage and healing entries carry no CVar, so *no* per-category CVar can stop them. The only
+-- switch that does is the master enableFloatingCombatText: CombatText:OnLoad() calls
+-- CombatTextUtil.UpdateEventRegistration(self, C_CVar.GetCVarBool("enableFloatingCombatText")),
+-- and the settings callback repeats that when the value flips. With "0" the frame is not
+-- registered for COMBAT_TEXT_UPDATE at all and OnEvent never runs.
+--
+-- That is why 1.63/1.64 could report success and still show numbers: it wrote
+-- floatingCombatTextCombatDamage_v2, read it back as "0", and the client never looked at it.
+--
+-- The per-category CVars still matter on the classic families, whose FloatingCombatText reads
+-- them directly, so they stay steered as a second line of defence.
+local BLIZZARD_FCT_MASTER_CVAR = "enableFloatingCombatText"
+NameplateSCT.blizzardFCTMasterCVar = BLIZZARD_FCT_MASTER_CVAR
+
+-- Periodic damage, avoidance (miss/dodge/parry/evade/immune/deflect) and damage reduction
+-- (resist/block/absorb) each have their own CVar on the modern clients. Healing, resources,
+-- auras and combat-state text are deliberately left alone: this addon never draws those, so
+-- they cannot double up.
+local BLIZZARD_TEXT_BASENAMES = {
+	"floatingCombatTextCombatDamage",
+	"floatingCombatTextCombatLogPeriodicSpells",
+	"floatingCombatTextDodgeParryMiss",
+	"floatingCombatTextDamageReduction",
+}
+
+local blizzardTextCvars = {}
+do
+	local suffix = isModernCvar and "_v2" or ""
+	for index, base in ipairs(BLIZZARD_TEXT_BASENAMES) do
+		blizzardTextCvars[index] = base .. suffix
+	end
+end
+NameplateSCT.blizzardTextCVars = blizzardTextCvars
+
 -- issecretvalue / canaccessvalue are documented on every supported client (live, classic,
 -- classic_era, classic_anniversary and forever). Classic clients pass them through: they
 -- answer "not secret" and "accessible" without caring about taint at all, so the same code
@@ -91,6 +133,19 @@ end
 -- Resolve a unit token to its nameplate frame, or nil when the client must not be asked.
 -- A target-of-target has no plate to resolve, so a nameplate-anchored draw is skipped for
 -- it while screen mode (which needs no plate) still draws it.
+-- The character unit frame, used when numbers about you are mounted there instead of a screen
+-- area. PlayerFrame is the client's own frame (retail, classic and Forever all name it that);
+-- returning nil keeps the number on screen instead of dropping it.
+---@return Frame?
+local function getPlayerUnitFrameAnchor()
+	local frame = _G.PlayerFrame
+	if type(frame) == "table" and type(frame.IsShown) == "function" then
+		local ok, shown = pcall(frame.IsShown, frame)
+		if ok and shown then return frame end
+	end
+	return nil
+end
+
 ---@param unit string?
 ---@return Frame?
 local function getNamePlateForUnit(unit)
@@ -118,6 +173,11 @@ end
 local hasCombatRestrictions = clientHasCombatRestrictions()
 
 NameplateSCT.hasCombatRestrictions = hasCombatRestrictions
+-- Exported for the settings window, which labels the client and picks the right CVar name
+-- from these. They are file locals, and a missing export is invisible until the UI shows
+-- "Classic" on a Forever client.
+NameplateSCT.isForever = isForever
+NameplateSCT.isMidnight = isMidnight
 
 -- Live counters read by the options dashboard, so "no numbers" can be diagnosed instead of
 -- guessed: a counter that never moves points at the event source, not at the styling.
@@ -241,7 +301,21 @@ local defaults = {
 		useMissColor = false,
 		missColor = "ffffff",
 
-		showIcon = true,
+		-- One switch per kind of hit the addon can draw, so every category the client reports
+		-- has a control instead of a yes for some and a silent no for others.
+		showMeleeDamage = true,
+		showSpellDamage = true,
+		showRangedDamage = true,
+		showPeriodicDamage = true,
+		showHealing = true,
+		-- Pet damage is only distinguishable in the combat log; UNIT_COMBAT carries no source.
+		showPetDamage = true,
+
+		healColor = "00ff00",
+		useHealCritColor = false,
+		healCritColor = "33ff66",
+
+		showIcon = false,
 		showIconOnly = false,
 		removeBorder = false,
 		enableMSQ = true,
@@ -279,6 +353,8 @@ local defaults = {
 			ability = "fountain",
 			crit = "verticalUp",
 			miss = "verticalUp",
+			heal = "verticalUp",
+			healCrit = "verticalUp",
 			autoattack = "fountain",
 			autoattackcrit = "verticalUp",
 			animationspeed = 1,
@@ -300,6 +376,9 @@ local defaults = {
 		-- Where numbers are drawn. "nameplates" anchors each number to its plate,
 		-- "screen" anchors it to a fixed area on screen (the mode PlateSCT offers).
 		displayMode = "nameplates",
+		-- Where numbers about you (damage you take, heals on you) are mounted: a screen area,
+		-- or your character unit frame.
+		personalAnchor = "screen",
 		screen = {
 			outgoingX = 0, outgoingY = -140,
 			incomingX = 0, incomingY = 110,
@@ -500,6 +579,63 @@ local function hexToRGB(hex)
 	return (tonumber(hex:sub(1, 2), 16) or 0) / 255,
 		(tonumber(hex:sub(3, 4), 16) or 0) / 255,
 		(tonumber(hex:sub(5, 6), 16) or 0) / 255
+end
+
+-- Colour travels beside the text as plain numbers and is applied with FontString:SetTextColor.
+-- Inline |Cff codes cannot work on the restricted clients: the amount is a secret value that
+-- may not be concatenated or formatted, so wrapping it would either raise or hand the client a
+-- white number. Keeping the text plain also lets one string change colour between draws.
+-- Every hit category switch is named here, literally, so a category cannot be added to the
+-- client mapping without also being readable and auditable in one place.
+---@param key string
+---@return boolean
+function NameplateSCT:IsHitCategoryEnabled(key)
+	local profile = self.db.profile
+	if key == "showMeleeDamage" then return profile.showMeleeDamage ~= false end
+	if key == "showSpellDamage" then return profile.showSpellDamage ~= false end
+	if key == "showRangedDamage" then return profile.showRangedDamage ~= false end
+	if key == "showPeriodicDamage" then return profile.showPeriodicDamage ~= false end
+	if key == "showPetDamage" then return profile.showPetDamage ~= false end
+	if key == "showHealing" then return profile.showHealing ~= false end
+	return true
+end
+
+---@param isPersonal boolean
+---@param school number|string|nil
+---@param spellName string|nil
+---@param crit boolean|nil
+---@return number, number, number
+function NameplateSCT:GetTextColor(isPersonal, school, spellName, crit)
+	local profile = self.db.profile
+	if crit and profile.useCritColor then
+		return hexToRGB(profile.critColor)
+	end
+	if isPersonal then
+		if profile.damageColorPersonal and school and DAMAGE_TYPE_COLORS[school] then
+			return hexToRGB(DAMAGE_TYPE_COLORS[school])
+		end
+		if profile.damageColorPersonal and spellName == "melee" and DAMAGE_TYPE_COLORS.melee then
+			return hexToRGB(DAMAGE_TYPE_COLORS.melee)
+		end
+		return hexToRGB(profile.defaultColorPersonal)
+	end
+	if profile.damageColor and school and DAMAGE_TYPE_COLORS[school] then
+		return hexToRGB(DAMAGE_TYPE_COLORS[school])
+	end
+	if profile.damageColor and spellName == "melee" and DAMAGE_TYPE_COLORS.melee then
+		return hexToRGB(DAMAGE_TYPE_COLORS.melee)
+	end
+	return hexToRGB(profile.defaultColor)
+end
+
+---@param crit boolean|nil
+---@return number, number, number
+function NameplateSCT:GetHealColor(crit)
+	local profile = self.db.profile
+	if crit and profile.useHealCritColor then
+		return hexToRGB(profile.healCritColor)
+	end
+	return hexToRGB(profile.healColor)
 end
 
 -- The shadow is a second FontString under the number. It carries the same string - a secret
@@ -708,16 +844,249 @@ end
 
 -- Blizzard's own nameplate damage numbers double up with ours. Only ever steer the one
 -- CVar this addon is responsible for, and only while nameplate mode is active.
-function NameplateSCT:ApplyBlizzardFCT()
-	if not self.db then return end
-	local global = self.db.profile
-	if not global.hideBlizzardFCT then return end
-	if global.displayMode ~= "nameplates" then return end
+-- What the player had before this addon steered those CVars, so turning the setting off puts
+-- them back instead of leaving Blizzard's text off for good.
+-- The CVar API takes a cstring value and rejects read-only or secure CVars *without raising*
+-- (CVarDocumentation: value is cstring, RequiresValidAndPublicCVar / RequiresNonReadOnlyCVar /
+-- RequiresNonSecureCVar). Passing the number 0 silently did nothing, so the setting looked on
+-- while the CVar still read "1". Write the string form, then read it back to prove it landed.
+---@param name string
+---@param value string
+---@return boolean written
+local function writeBlizzardCvar(name, value)
+	-- A CVar this client does not expose is not a failure, it is simply not part of that
+	-- client's model. GetCVar answers nil for unknown names on every supported family.
+	if GetCVar(name) == nil then return true end
+	local text = tostring(value)
+	local modern = _G.C_CVar and _G.C_CVar.SetCVar
+	local writers = { SetCVar, modern }
+	for _, writer in ipairs(writers) do
+		if writer then
+			local ok = pcall(writer, name, text)
+			if ok and GetCVar(name) == text then return true end
+		end
+	end
+	return false
+end
 
-	local cvar = blizzardCvar
-	if not cvar then return end
-	local ok = pcall(SetCVar, cvar, 0)
-	if not ok then pcall(SetCVar, cvar, "0") end
+---@return table|nil frame the client's combat-text renderer, if it is loaded
+local function getCombatTextFrame()
+	local frame = _G.CombatText
+	if type(frame) == "table" and type(frame.IsEventRegistered) == "function" then
+		return frame
+	end
+	return nil
+end
+
+--- Whether the client's renderer is currently receiving combat-text events.
+--- This - not our own CVar write - is what decides whether numbers appear.
+---@return boolean|nil registered nil when the renderer is not loaded
+local function isCombatTextRegistered()
+	local frame = getCombatTextFrame()
+	if not frame then return nil end
+	local ok, registered = pcall(frame.IsEventRegistered, frame, "COMBAT_TEXT_UPDATE")
+	if not ok then return nil end
+	return registered and true or false
+end
+
+--- Drive the client's own registration path, so the change lands now instead of next reload.
+--- Blizzard does exactly this through CombatTextUtil.UpdateEventRegistration.
+---@param enable boolean
+---@return boolean applied
+local function setCombatTextRegistered(enable)
+	local frame = getCombatTextFrame()
+	if not frame then return false end
+	local util = _G.CombatTextUtil
+	if util and type(util.UpdateEventRegistration) == "function" then
+		local ok = pcall(util.UpdateEventRegistration, frame, enable)
+		if ok then return true end
+	end
+	if not enable and type(frame.UnregisterAllEvents) == "function" then
+		local ok = pcall(frame.UnregisterAllEvents, frame)
+		if ok then return true end
+	end
+	return false
+end
+
+--- The value a switch should be handed back to when the addon has no record of it.
+--- `GetCVarDefault` is the client's own "on by default" answer, so a lost record can never
+--- leave Blizzard's text muted for good.
+---@param name string
+---@return string
+local function blizzardCvarFallback(name)
+	local getter = _G.GetCVarDefault
+	if type(getter) == "function" then
+		local ok, value = pcall(getter, name)
+		if ok and type(value) == "string" then return value end
+	end
+	return "1"
+end
+
+-- What the switches held before the addon muted them. Memory-only on purpose: the record is
+-- per session, and `rememberBlizzardCvar` refuses to record "0", so a record lost to a reload
+-- still hands the text back instead of leaving the client muted for good.
+local savedBlizzardCvars
+
+---@param saved table<string, string>
+---@param name string
+local function rememberBlizzardCvar(saved, name)
+	if saved[name] ~= nil then return end
+	local previous = GetCVar(name)
+	if previous ~= nil and previous ~= "0" then
+		saved[name] = previous
+	else
+		saved[name] = blizzardCvarFallback(name)
+	end
+end
+
+-- Set while ApplyBlizzardFCT is writing, so the CVAR_UPDATE it triggers cannot re-enter it.
+local applyingBlizzardFCT = false
+
+function NameplateSCT:ApplyBlizzardFCT()
+	if applyingBlizzardFCT then return end
+	if not self.db then return end
+	local profile = self.db.profile
+	if not profile then return end
+	applyingBlizzardFCT = true
+
+	-- The addon being switched off must give Blizzard's text back: muting the client while
+	-- drawing nothing of our own would leave the player with no numbers at all.
+	local suppress = profile.hideBlizzardFCT == true and profile.enabled == true
+
+	if not suppress then
+		if savedBlizzardCvars then
+			for name, value in pairs(savedBlizzardCvars) do
+				writeBlizzardCvar(name, value)
+			end
+			savedBlizzardCvars = nil
+		end
+		-- Put the client's renderer back the way the restored value says it should be. A value
+		-- the client cannot read means "not muted by us", so hand the text back.
+		local master = GetCVar(BLIZZARD_FCT_MASTER_CVAR)
+		setCombatTextRegistered(master ~= "0")
+		if type(_G.CombatText_UpdateDisplayedMessages) == "function" then
+			pcall(_G.CombatText_UpdateDisplayedMessages)
+		end
+		-- Nothing is being suppressed, so nothing can be failing.
+		if self.diagnostics then self.diagnostics.fctFailed = 0 end
+		applyingBlizzardFCT = false
+		return
+	end
+
+	-- Honoured in screen mode too: the setting is the player's explicit choice, and silently
+	-- skipping it because of the display mode is how "I turned it on and nothing happened"
+	-- happens.
+	savedBlizzardCvars = savedBlizzardCvars or {}
+	local saved = savedBlizzardCvars
+	local failed = 0
+
+	-- The master switch first: it is the only one that stops damage and healing text.
+	rememberBlizzardCvar(saved, BLIZZARD_FCT_MASTER_CVAR)
+	if not writeBlizzardCvar(BLIZZARD_FCT_MASTER_CVAR, "0") then failed = failed + 1 end
+
+	-- Then the per-category CVars that the classic families consult directly.
+	for _, name in ipairs(blizzardTextCvars) do
+		rememberBlizzardCvar(saved, name)
+		if not writeBlizzardCvar(name, "0") then failed = failed + 1 end
+	end
+
+	-- The CVar is what survives a reload; the registration is what stops the numbers now.
+	setCombatTextRegistered(false)
+	if type(_G.CombatText_UpdateDisplayedMessages) == "function" then
+		pcall(_G.CombatText_UpdateDisplayedMessages)
+	end
+
+	-- Reported by the dashboard: a client that refuses the write must not look like a bug in
+	-- the toggle.
+	local diagnostics = self.diagnostics
+	if diagnostics then diagnostics.fctFailed = failed end
+	applyingBlizzardFCT = false
+end
+
+-- Keep the setting authoritative: the game's own options (or another addon) can turn Blizzard's
+-- text back on while the toggle is on, and the player would see numbers return and think this
+-- setting broke again.
+function NameplateSCT:CVAR_UPDATE(_, cvar)
+	if cvar ~= BLIZZARD_FCT_MASTER_CVAR then return end
+	if applyingBlizzardFCT then return end
+	if not self.db or not self.db.profile then return end
+	if not self.db.profile.hideBlizzardFCT or not self.db.profile.enabled then return end
+	-- This event is also the echo of our own write, which can arrive after the write returned.
+	-- Nothing to do when the switch already reads off and the client has already stopped.
+	if GetCVar(BLIZZARD_FCT_MASTER_CVAR) == "0" and isCombatTextRegistered() == false then return end
+	self:ApplyBlizzardFCT()
+end
+
+-- The client can reset these while logging in or on a loading screen, so the setting is
+-- re-applied once the world is there.
+function NameplateSCT:PLAYER_ENTERING_WORLD()
+	if self.db and self.db.profile then self:ApplyBlizzardFCT() end
+end
+
+--- How many combat-text CVars this client has, and how many still read "on".
+---@return number steered, number stillOn
+function NameplateSCT:GetBlizzardFCTState()
+	local steered, stillOn = 0, 0
+	local master = GetCVar(BLIZZARD_FCT_MASTER_CVAR)
+	if master ~= nil then
+		steered = steered + 1
+		if master == "1" then stillOn = stillOn + 1 end
+	end
+	for _, name in ipairs(blizzardTextCvars) do
+		local value = GetCVar(name)
+		if value ~= nil then
+			steered = steered + 1
+			if value == "1" then stillOn = stillOn + 1 end
+		end
+	end
+	return steered, stillOn
+end
+
+--- Whether the client can still draw its own numbers, read from the client rather than from
+--- our own write. A dashboard that trusts the write is how 1.64 reported green while Blizzard
+--- kept drawing: the CVar read "0" and nothing consulted it.
+---@return boolean stopped, string reason
+function NameplateSCT:GetBlizzardFCTStatus()
+	local registered = isCombatTextRegistered()
+	if registered == true then
+		return false, "the client is still drawing its own text"
+	end
+	local master = GetCVar(BLIZZARD_FCT_MASTER_CVAR)
+	if master ~= nil and master ~= "0" then
+		return false, BLIZZARD_FCT_MASTER_CVAR .. " still reads " .. tostring(master)
+	end
+	if registered == nil and master == nil then
+		-- Neither switch is exposed on this family; fall back to the category CVars.
+		local steered, stillOn = self:GetBlizzardFCTState()
+		if steered == 0 then return true, "this client has no combat-text switch" end
+		if stillOn > 0 then
+			return false, stillOn .. " of " .. steered .. " text switches are still on"
+		end
+	end
+	return true, "Blizzard's combat text is off"
+end
+
+-- Addons that draw their own numbers in the same place. If one of these is loaded, "I turned
+-- Blizzard's numbers off and they still show" has a name, instead of another round of guesswork.
+local RIVAL_FCT_ADDONS = { "PlateSCT", "ClassicFCT" }
+
+--- Which other number-drawing addons are loaded right now.
+---@return string[] names
+function NameplateSCT:GetNumberRivals()
+	local rivals = {}
+	local isLoaded
+	local addons = _G.C_AddOns
+	if type(addons) == "table" and type(addons.IsAddOnLoaded) == "function" then
+		isLoaded = addons.IsAddOnLoaded
+	elseif type(_G.IsAddOnLoaded) == "function" then
+		isLoaded = _G.IsAddOnLoaded
+	end
+	if not isLoaded then return rivals end
+	for _, name in ipairs(RIVAL_FCT_ADDONS) do
+		local ok, loadedOrLoading = pcall(isLoaded, name)
+		if ok and loadedOrLoading then rivals[#rivals + 1] = name end
+	end
+	return rivals
 end
 
 ----------------
@@ -784,6 +1153,32 @@ end
 
 NameplateSCT.migrateSettingsToProfile = migrateSettingsToProfile
 
+-- Defaults that changed after a build shipped. A profile saved by an older version keeps the
+-- old default in its saved variables, so a new default alone would never reach an existing
+-- player. Each change is recorded on the saved variable, so it runs once per account and never
+-- overrides a player who turns the setting back on afterwards.
+---@param db table
+---@param savedVariableName string
+---@return boolean changed
+local function applyDefaultChanges(db, savedVariableName)
+	local saved = rawget(_G, savedVariableName)
+	if type(saved) ~= "table" then return false end
+	local changed = false
+
+	-- Spell icons used to default to on; they are off by default now.
+	if saved.iconDefaultOff ~= true then
+		if db.profile.showIcon == true then
+			db.profile.showIcon = false
+			changed = true
+		end
+		saved.iconDefaultOff = true
+	end
+
+	return changed
+end
+
+NameplateSCT.applyDefaultChanges = applyDefaultChanges
+
 function NameplateSCT:ConvertDB()
 	if type(NameplateSCT.db.profile.strata.offTarget) == "string" then
 		for k, v in ipairs(STRATAS) do
@@ -805,6 +1200,7 @@ function NameplateSCT:OnInitialize()
 	-- setup db
 	self.db = LibStub("AceDB-3.0"):New("NameplateSCTDB", defaults, true)
 	self.migratedSettings = migrateSettingsToProfile(self.db, "NameplateSCTDB")
+	self.defaultsUpdated = applyDefaultChanges(self.db, "NameplateSCTDB")
 
 	-- Adjust anything that was edited in the db to be correct
 	self:ConvertDB()
@@ -858,6 +1254,10 @@ function NameplateSCT:OnEnable()
 		pcall(self.RegisterEvent, self, "COMBAT_LOG_EVENT_UNFILTERED")
 	end
 
+	self:RegisterEvent("PLAYER_ENTERING_WORLD")
+	-- Re-assert the Blizzard-text setting when the game's own options try to turn it back on.
+	self:RegisterEvent("CVAR_UPDATE")
+
 	self.db.profile.enabled = true
 
 	-- The dashboard reports whether the event source is actually subscribed, which is the
@@ -885,6 +1285,10 @@ function NameplateSCT:OnDisable()
 	end
 
 	self.db.profile.enabled = false
+
+	-- Hand Blizzard's own text back: with the addon off, a muted client would leave the player
+	-- with no numbers at all.
+	self:ApplyBlizzardFCT()
 end
 
 
@@ -1246,6 +1650,17 @@ function NameplateSCT:NAME_PLATE_UNIT_REMOVED(event, unitID)
 	end
 end
 
+-- Which switch governs a combat-log hit. The event name carries the kind, so the same table
+-- serves both damage paths.
+---@param clue string
+---@return string
+local function cleuCategory(clue)
+	if string.find(clue, "SWING", 1, true) then return "showMeleeDamage" end
+	if string.find(clue, "RANGE", 1, true) then return "showRangedDamage" end
+	if string.find(clue, "PERIODIC", 1, true) then return "showPeriodicDamage" end
+	return "showSpellDamage"
+end
+
 function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, destGUID, _, _, _, ...)
 	local d = NameplateSCT.diagnostics
 	if d then d.events = d.events + 1; d.lastEvent = GetTime() end
@@ -1253,6 +1668,7 @@ function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, de
 		return countDrop("secret values blocked")
 	end
     playerGUID = playerGUID or UnitGUID("player")
+    local isHeal = string.find(clue, "_HEAL", 1, true) ~= nil
     if NameplateSCT.db.profile.personalOnly and NameplateSCT.db.profile.personal and playerGUID ~= destGUID then
 		return countDrop("personal only") -- Cancel out any non player targetted abilities if you have personalSCT only enabled
 	end
@@ -1266,8 +1682,19 @@ function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, de
 	end
 	if playerGUID == sourceGUID or (NameplateSCT.db.profile.personal and playerGUID == destGUID) then -- Player events
 		local destUnit = guidToUnit[destGUID]
-		if (destUnit) or (destGUID == playerGUID and NameplateSCT.db.profile.personal) then
-			if string.find(clue, "_MISSED") then
+		if (destUnit) or (destGUID == playerGUID and (NameplateSCT.db.profile.personal or isHeal)) then
+			if isHeal then
+				-- SPELL_HEAL / SPELL_PERIODIC_HEAL carry the same shape: spell, then the amount.
+				local spellId, spellName, _, healAmount, _, _, healCrit = ...
+				if spellId and spellId == 0 then spellId = nil end
+				if NameplateSCT.db.profile.filterEnabled then
+					local spellInFilter = filtersTable[tostring(spellId)] or filtersTable[spellName]
+					if (NameplateSCT.db.profile.inverseSpellFilter and not spellInFilter) or (not NameplateSCT.db.profile.inverseSpellFilter and spellInFilter) then
+						return
+					end
+				end
+				return self:HealEvent(destGUID, spellName, healAmount, healCrit, spellId)
+			elseif string.find(clue, "_MISSED") then
 				local spellName, missType, spellId, amount, school, critical
 
 				if (string.find(clue, "SWING")) then
@@ -1307,13 +1734,17 @@ function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, de
 						return
 					end
 				end
-				self:DamageEvent(destGUID, spellName, amount, overkill, school, critical, spellId, absorbed)
+				self:DamageEvent(destGUID, spellName, amount, overkill, school, critical, spellId, absorbed, cleuCategory(clue))
 			end
 		end
 	elseif sourceFlags and (bit.band(sourceFlags, COMBATLOG_OBJECT_TYPE_GUARDIAN) > 0 or bit.band(sourceFlags, COMBATLOG_OBJECT_TYPE_PET) > 0) and bit.band(sourceFlags, COMBATLOG_OBJECT_AFFILIATION_MINE) > 0 then -- Pet/Guardian events
 		local destUnit = guidToUnit[destGUID]
-		if (destUnit) or (destGUID == playerGUID and NameplateSCT.db.profile.personal) then
-			if string.find(clue, "_MISSED") then
+		if (destUnit) or (destGUID == playerGUID and (NameplateSCT.db.profile.personal or isHeal)) then
+			if isHeal then
+				local spellId, spellName, _, healAmount, _, _, healCrit = ...
+				if spellId and spellId == 0 then spellId = nil end
+				return self:HealEvent(destGUID, spellName, healAmount, healCrit, spellId)
+			elseif string.find(clue, "_MISSED") then
 				local spellName, missType, spellId, amount, critical
 
 				if (string.find(clue, "SWING")) then
@@ -1351,7 +1782,7 @@ function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, de
 						return
 					end
 				end
-				self:DamageEvent(destGUID, spellName, amount, overkill, "pet", critical, spellId, absorbed)
+				self:DamageEvent(destGUID, spellName, amount, overkill, "pet", critical, spellId, absorbed, cleuCategory(clue), true)
 			end
 		end
 	end
@@ -1400,22 +1831,109 @@ local function recentAttributedSpell()
 	return attributedSpellID
 end
 
+-- Which switch governs a UNIT_COMBAT hit, per action. The client reports one action per kind
+-- of hit, so the same table also tells the animation pair apart.
+local DAMAGE_CATEGORY = {
+	SWING = "showMeleeDamage",
+	WOUND = "showMeleeDamage",
+	SPELL = "showSpellDamage",
+	DAMAGE = "showSpellDamage",
+	RANGE = "showRangedDamage",
+	PERIODIC = "showPeriodicDamage",
+}
+
+-- SWING and WOUND are the auto-attack events, so they get the auto-attack animation pair.
+local AUTO_ATTACK_ACTIONS = { SWING = true, WOUND = true }
+
+--- Draw one heal on the unit that received it. Shared by both combat paths: the text, size,
+--- colour and animation of a heal do not depend on where the event came from.
+---@param unit string?
+---@param amount any secret value on the restricted clients, never formatted there
+---@param crit boolean
+---@param spellId any
+---@param guid string?
+function NameplateSCT:DrawHeal(unit, amount, crit, spellId, guid)
+	local profile = self.db.profile
+	if not profile.showHealing then return countDrop("healing is off") end
+
+	local text
+	local isSecretAmount = isSecretValue(amount)
+	if isSecretAmount then
+		-- The client hands the amount over as a secret value: it goes to SetText by identity,
+		-- so not even a leading "+" may be added to it.
+		text = amount
+	elseif type(amount) == "number" then
+		text = "+" .. self:truncateText(amount)
+	else
+		text = tostring(amount)
+	end
+
+	local animation = crit and profile.animations.healCrit or profile.animations.heal
+	if animation == "disabled" then return countDrop("heal animation is disabled") end
+
+	local size = profile.formatting.size
+	if crit and profile.sizing.crits then
+		size = size * profile.sizing.critsScale
+	end
+	if not size or size < 5 then size = 5 end
+
+	local red, green, blue = self:GetHealColor(crit)
+	self:DisplayText(guid, text, size, animation, spellId, crit and true or false, nil, unit, red, green, blue)
+end
+
+--- Combat-log heals: the destination GUID names the unit that was healed.
+---@param guid string
+---@param spellName string?
+---@param amount any
+---@param crit boolean
+---@param spellId any
+function NameplateSCT:HealEvent(guid, spellName, amount, crit, spellId)
+	if not self.db.profile.showHealing then return countDrop("healing is off") end
+	local onPlayer = guid == playerGUID
+	local unit = onPlayer and "player" or guidToUnit[guid]
+	if not unit then return countDrop("no nameplate for unit") end
+	return self:DrawHeal(unit, amount, crit and true or false, spellId, onPlayer and nil or guid)
+end
+
 function NameplateSCT:UNIT_COMBAT(event, unit, action, flagText, amount, schoolMask)
 	if event ~= "UNIT_COMBAT" then return end
 	local d = self.diagnostics
 	if d then d.events = d.events + 1; d.lastEvent = GetTime() end
 	if not unit or not action then return end
 	if isSecretValue(unit) or isSecretValue(action) then return end
-	if not self.db.profile.enabled then return countDrop("addon disabled") end
-	if action == "HEAL" or action == "ENERGIZE" then return countDrop("healing") end
+	local profile = self.db.profile
+	if not profile.enabled then return countDrop("addon disabled") end
 
+	local isHeal = (action == "HEAL")
+	if action == "ENERGIZE" then return countDrop("resource gains are not drawn") end
 	local isMiss = MISS_ACTIONS[action] == true
-	if not isMiss and not HIT_ACTIONS[action] then return countDrop("unknown action") end
-	if isMiss and not self.db.profile.showMisses then return countDrop("misses off") end
+	if not isHeal and not isMiss and not HIT_ACTIONS[action] then return countDrop("unknown action") end
+	if isHeal and not profile.showHealing then return countDrop("healing is off") end
+	if isMiss and not profile.showMisses then return countDrop("misses off") end
+
+	local category = (not isHeal and not isMiss) and DAMAGE_CATEGORY[action] or nil
+	if category and not self:IsHitCategoryEnabled(category) then return countDrop("that kind of damage is off") end
+
+	-- The client says whether the hit was a crit. Forever does not expose a combat log, but
+	-- UNIT_COMBAT carries the same flags Blizzard's own combat feedback reads.
+	local crit = (flagText == "CRITICAL" or flagText == "CRUSHING")
 
 	-- Resolve the anchor first: nameplate mode needs a plate, screen mode does not.
 	local isPlayer = (unit == "player")
-	if isPlayer and not self.db.profile.personal then return countDrop("damage you take is off") end
+	if not isPlayer then
+		-- Damage you take can arrive under an alias that points at you: while a mob is
+		-- hitting you, your target's target is you. Promote it to the player token so the
+		-- "Show damage you take" setting governs it, screen mode puts it on the incoming
+		-- side, and the duplicate collapse uses one bucket.
+		local isSelf, answered = safeUnitIsUnit(unit, "player")
+		if answered and isSelf then
+			isPlayer = true
+			unit = "player"
+		end
+	end
+	-- "Damage you take" gates damage; a heal on you is its own category.
+	if isPlayer and not isHeal and not profile.personal then return countDrop("damage you take is off") end
+
 	local screenMode = self:IsScreenMode()
 	local plate
 	if not isPlayer and not screenMode then
@@ -1446,56 +1964,72 @@ function NameplateSCT:UNIT_COMBAT(event, unit, action, flagText, amount, schoolM
 	-- displayOffTargetText is honoured on both paths: an off-target unit known not to be
 	-- the target is dropped when the setting is off. An answer the client refused keeps the
 	-- number, because hiding everything would be worse than an extra number.
-	if not isPlayer and targetKnown and not onTarget and not self.db.profile.displayOffTargetText then
+	if not isPlayer and targetKnown and not onTarget and not profile.displayOffTargetText then
 		return countDrop("off-target text is off")
 	end
 
+	if isHeal then
+		return self:DrawHeal(unit, amount, crit, recentAttributedSpell())
+	end
+
 	if isMiss then
-		local animation = isPlayer and self.db.profile.animationsPersonal.miss or self.db.profile.animations.miss
+		local animation = isPlayer and profile.animationsPersonal.miss or profile.animations.miss
 		if animation == "disabled" then return countDrop("miss animation is disabled") end
 
 		local color
 		if isPlayer then
-			color = self.db.profile.useMissColorPersonal and self.db.profile.missColorPersonal
+			color = profile.useMissColorPersonal and profile.missColorPersonal
 		else
-			color = self.db.profile.useMissColor and self.db.profile.missColor
+			color = profile.useMissColor and profile.missColor
 		end
 		color = color or (isPlayer and defaults.profile.missColorPersonal or defaults.profile.missColor)
 
-		local size = self.db.profile.formatting.size
-		if (not isPlayer) and targetKnown and not onTarget and self.db.profile.useOffTargetAppearance then
-			size = self.db.profile.offTargetFormatting.size
+		local size = profile.formatting.size
+		if (not isPlayer) and targetKnown and not onTarget and profile.useOffTargetAppearance then
+			size = profile.offTargetFormatting.size
 		end
-		if (not isPlayer) and self.db.profile.sizing.miss then
-			size = size * self.db.profile.sizing.missScale
+		if (not isPlayer) and profile.sizing.miss then
+			size = size * profile.sizing.missScale
 		end
 		if size < 5 then size = 5 end
 
 		if d then d.misses = d.misses + 1 end
-		local text = "|Cff" .. color .. (MISS_EVENT_STRINGS[action] or L["Missed"]) .. "|r"
-		self:DisplayText(nil, text, size, animation, recentAttributedSpell(), true, nil, unit)
+		local red, green, blue = hexToRGB(color)
+		self:DisplayText(nil, MISS_EVENT_STRINGS[action] or L["Missed"], size, animation,
+			recentAttributedSpell(), true, nil, unit, red, green, blue)
 		return
 	end
 
-	-- A hit. Threshold filtering and every size modifier are numeric comparisons that a
+	-- A hit. Threshold filtering and the small-hit modifiers are numeric comparisons that a
 	-- secret amount cannot survive, so with a secret amount the raw value goes straight to
 	-- the FontString and the numeric modifiers are skipped.
 	local isSecretAmount = isSecretValue(amount)
 	if isSecretAmount and d then d.secret = d.secret + 1 end
 
 	if not isSecretAmount and type(amount) == "number" then
-		local floor = math.max(self.db.profile.sizing.hideSmallHitsThreshold or 0, self.db.profile.minDamage or 0)
+		local floor = math.max(profile.sizing.hideSmallHitsThreshold or 0, profile.minDamage or 0)
 		if floor > amount then
 			return countDrop("under the damage threshold")
 		end
 	end
 
-	local animation = isPlayer and self.db.profile.animationsPersonal.normal or self.db.profile.animations.ability
+	local autoattack = AUTO_ATTACK_ACTIONS[action] == true
+	local animation
+	if isPlayer then
+		animation = (crit and profile.animationsPersonal.crit) or profile.animationsPersonal.normal
+	elseif autoattack then
+		animation = (crit and profile.animations.autoattackcrit) or profile.animations.autoattack
+	else
+		animation = (crit and profile.animations.crit) or profile.animations.ability
+	end
 	if animation == "disabled" then return countDrop("animation is disabled") end
 
-	local size = self.db.profile.formatting.size
-	if (not isPlayer) and targetKnown and not onTarget and self.db.profile.useOffTargetAppearance then
-		size = self.db.profile.offTargetFormatting.size
+	local size = profile.formatting.size
+	if (not isPlayer) and targetKnown and not onTarget and profile.useOffTargetAppearance then
+		size = profile.offTargetFormatting.size
+	end
+	if crit and not isPlayer and profile.sizing.crits and (not autoattack or profile.sizing.autoattackcritsizing) then
+		size = size * profile.sizing.critsScale
 	end
 	if not size or size < 5 then size = 5 end
 
@@ -1504,20 +2038,13 @@ function NameplateSCT:UNIT_COMBAT(event, unit, action, flagText, amount, schoolM
 		text = amount
 	elseif type(amount) == "number" then
 		text = self:truncateText(amount)
-		if isPlayer then
-			text = "-" .. text
-			if self.db.profile.damageColorPersonal then
-				text = "|Cff" .. self.db.profile.defaultColorPersonal .. text .. "|r"
-			end
-		elseif self.db.profile.damageColor then
-			local color = (schoolMask and DAMAGE_TYPE_COLORS[schoolMask]) or self.db.profile.defaultColor
-			text = "|Cff" .. color .. text .. "|r"
-		end
+		if isPlayer then text = "-" .. text end
 	else
 		text = tostring(amount)
 	end
 
-	self:DisplayText(nil, text, size, animation, recentAttributedSpell(), false, nil, unit)
+	local red, green, blue = self:GetTextColor(isPlayer, schoolMask, nil, crit)
+	self:DisplayText(nil, text, size, animation, recentAttributedSpell(), crit, nil, unit, red, green, blue)
 end
 
 -------------
@@ -1594,7 +2121,9 @@ end
 local numDamageEvents = 0
 local lastDamageEventTime
 local runningAverageDamageEvents = 0
-function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, crit, spellId, absorbed)
+function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, crit, spellId, absorbed, category, isPet)
+	if isPet and not self:IsHitCategoryEnabled("showPetDamage") then return countDrop("pet damage is off") end
+	if category and not self:IsHitCategoryEnabled(category) then return countDrop("that kind of damage is off") end
 	local isSecretAmount = isSecretValue(amount)
 	if isSecretAmount and NameplateSCT.diagnostics then
 		NameplateSCT.diagnostics.secret = NameplateSCT.diagnostics.secret + 1
@@ -1615,6 +2144,7 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
 	end
 
 	local text, animation, pow, size
+	local red, green, blue = 1, 1, 1
 	local autoattack = spellName == "melee" or spellName == "pet"
 	local critFlag = (not isSecretCrit) and (crit == true or crit == 1)
 
@@ -1667,9 +2197,9 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
                 local absorbedText = self:truncateText(absorbed)
                 text = L["%s (A: %s)"]:format(text, absorbedText)
             end
-            -- color text
-            text = self:ColorText(text, guid, playerGUID, school, spellName, crit)
         end
+        -- Colour is applied to the FontString, not woven into the text.
+        red, green, blue = self:GetTextColor(onPlayer, school, spellName, critFlag)
     end
 
 	-- shrink small hits
@@ -1712,10 +2242,10 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
     if NameplateSCT.db.profile.showIconOnly then
         self:DisplayIconWithoutText(guid, size, animation, spellId, pow, spellName)
     elseif (not isSecretAmount and type(overkill) == "number" and overkill > 0 and (self.db.profile.shouldDisplayOverkill or onPlayer)) then
-        text = self:ColorText(L["%s (O: %s)"]:format(text, self:truncateText(overkill)), guid, playerGUID, school, spellName, crit)
-        self:DisplayTextOverkill(guid, text, size, animation, spellId, pow, spellName)
+        text = L["%s (O: %s)"]:format(text, self:truncateText(overkill))
+        self:DisplayTextOverkill(guid, text, size, animation, spellId, pow, spellName, red, green, blue)
     else
-        self:DisplayText(guid, text, size, animation, spellId, pow, spellName)
+        self:DisplayText(guid, text, size, animation, spellId, pow, spellName, nil, red, green, blue)
     end
 end
 
@@ -1754,13 +2284,13 @@ function NameplateSCT:MissEvent(guid, spellName, missType, spellId)
 		text = missType
 	else
 		text = MISS_EVENT_STRINGS[missType] or L["Missed"]
-		text = "|Cff"..color..text.."|r"
 	end
+	local red, green, blue = hexToRGB(color)
 
-	self:DisplayText(guid, text, size, animation, spellId, pow, spellName)
+	self:DisplayText(guid, text, size, animation, spellId, pow, spellName, nil, red, green, blue)
 end
 
-function NameplateSCT:DisplayText(guid, text, size, animation, spellId, pow, spellName, unitOverride)
+function NameplateSCT:DisplayText(guid, text, size, animation, spellId, pow, spellName, unitOverride, red, green, blue)
 	local fontString
 	local icon
 	local unit = unitOverride
@@ -1769,18 +2299,25 @@ function NameplateSCT:DisplayText(guid, text, size, animation, spellId, pow, spe
 	end
 	local nameplate
 	local screenMode = self:IsScreenMode()
+	local isPersonal = (unit == "player")
+		or (guid ~= nil and playerGUID ~= nil and not isSecretValue(guid) and guid == playerGUID)
 
-	if screenMode then
-		local incoming = (unit == "player")
-			or (guid and playerGUID and not isSecretValue(guid) and guid == playerGUID)
-		nameplate = self:GetScreenAnchor(incoming)
+	-- Where numbers about you are mounted: the configured screen area, or your character unit
+	-- frame (the way PlateSCT's Incoming area can be placed over the frame, but built in).
+	local unitFrame
+	if isPersonal and self.db.profile.personalAnchor == "unitframe" then
+		unitFrame = getPlayerUnitFrameAnchor()
+	end
+
+	if unitFrame then
+		nameplate = unitFrame
+	elseif screenMode then
+		nameplate = self:GetScreenAnchor(isPersonal)
 	else
 		nameplate = getNamePlateForUnit(unit)
 
 		-- if there isn't an anchor frame, make sure that there is a guidNameplatePosition cache entry
-		if unit == "player" and not nameplate then
-			nameplate = "player"
-		elseif guid and playerGUID == guid and not unit then
+		if isPersonal and not nameplate then
 			nameplate = "player"
 		elseif (not nameplate) then
 			return countDrop("no anchor for this number")
@@ -1797,6 +2334,7 @@ function NameplateSCT:DisplayText(guid, text, size, animation, spellId, pow, spe
 
 	fontString.NSCTText = text
 	fontString:SetText(fontString.NSCTText)
+	fontString:SetTextColor(red or 1, green or 1, blue or 1)
 
 	fontString.NSCTFontSize = size
 	fontString:SetFont(getFontPath(NameplateSCT.db.profile.font), fontString.NSCTFontSize, NameplateSCT.db.profile.fontFlag)
@@ -1940,7 +2478,7 @@ function NameplateSCT:DisplayIconWithoutText(guid, size, animation, spellId, pow
 	self:Animate(fontString, nameplate, duration, animation)
 end
 
-function NameplateSCT:DisplayTextOverkill(guid, text, size, animation, spellId, pow, spellName)
+function NameplateSCT:DisplayTextOverkill(guid, text, size, animation, spellId, pow, spellName, red, green, blue)
 	local fontString
 	local icon
 	local nameplate = "player"
@@ -1949,6 +2487,7 @@ function NameplateSCT:DisplayTextOverkill(guid, text, size, animation, spellId, 
 
 	fontString.NSCTText = text
 	fontString:SetText(fontString.NSCTText)
+	fontString:SetTextColor(red or 1, green or 1, blue or 1)
 
 	fontString.NSCTFontSize = size
 	fontString:SetFont(getFontPath(NameplateSCT.db.profile.font), fontString.NSCTFontSize, NameplateSCT.db.profile.fontFlag)

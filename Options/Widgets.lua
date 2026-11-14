@@ -90,6 +90,10 @@ do
 	end
 end
 
+-- Fonts are always set on a region this addon owns. Never on a shared font object
+-- (GameFontNormal, GameFontHighlight, ...) and never by assigning STANDARD_TEXT_FONT: those
+-- are used by the whole client, so writing them repaints action bars, chat and tooltips.
+-- The harness fails the build if such a write ever appears.
 function W.SetFont(region, role, size, flags)
 	region:SetFont(W.FontPath(role), size or 13, flags or "")
 end
@@ -553,7 +557,8 @@ function W.ToggleRow(parent, y, label, get, set, width, tooltip, isEnabled)
 	rowHover(row)
 
 	local fs = W.Text(row, label, 0, 0, width - 60, "medium", 14, C.text)
-	fs:SetPoint("TOPLEFT", row, "TOPLEFT", 0, 10)
+	fs:ClearAllPoints()
+	fs:SetPoint("LEFT", row, "LEFT", 0, 0)
 
 	local switch = W.Switch(row, get, set, tooltip)
 	switch:SetPoint("RIGHT", row, "RIGHT", 0, 0)
@@ -635,7 +640,11 @@ function W.SelectRow(parent, y, label, options, get, set, width, isEnabled)
 	row:SetPoint("TOPLEFT", parent, "TOPLEFT", 0, y)
 	rowHover(row)
 
-	W.Text(row, label, 0, 10, math.floor(width * 0.45), "medium", 14, C.text)
+	do
+		local labelText = W.Text(row, label, 0, 0, math.floor(width * 0.45), "medium", 14, C.text)
+		labelText:ClearAllPoints()
+		labelText:SetPoint("LEFT", row, "LEFT", 0, 0)
+	end
 
 	local button = CreateFrame("Button", nil, row)
 	button:SetSize(math.floor(width * 0.52), 30)
@@ -867,6 +876,10 @@ function W.ScrollPage(parent, width, height)
 	local viewport = CreateFrame("Frame", nil, parent)
 	viewport:SetSize(width, height)
 	viewport:SetClampedToScreen(false)
+	-- Children draw outside their parent unless the frame clips them, so a scrolled page
+	-- would spill rows past the bottom of the window. Clipping is what makes the viewport a
+	-- viewport.
+	if viewport.SetClipsChildren then viewport:SetClipsChildren(true) end
 
 	local content = CreateFrame("Frame", nil, viewport)
 	content:SetPoint("TOPLEFT", viewport, "TOPLEFT", 0, 0)
@@ -875,13 +888,14 @@ function W.ScrollPage(parent, width, height)
 	local state = { offset = 0, contentHeight = 0 }
 
 	local track = viewport:CreateTexture(nil, "BACKGROUND")
-	track:SetWidth(3)
-	track:SetColorTexture(rgb(C.line))
+	track:SetWidth(4)
+	track:SetColorTexture(rgb(C.field))
+	track:SetAlpha(0.9)
 	track:SetPoint("TOPRIGHT", viewport, "TOPRIGHT", 0, 0)
 	track:SetPoint("BOTTOMRIGHT", viewport, "BOTTOMRIGHT", 0, 0)
 
 	local thumb = viewport:CreateTexture(nil, "ARTWORK")
-	thumb:SetWidth(3)
+	thumb:SetWidth(4)
 	thumb:SetColorTexture(rgb(C.accent))
 	thumb:SetPoint("TOPRIGHT", viewport, "TOPRIGHT", 0, 0)
 	thumb:Hide()
@@ -903,7 +917,7 @@ function W.ScrollPage(parent, width, height)
 			return
 		end
 
-		local thumbHeight = math.max(28, height * (height / state.contentHeight))
+		local thumbHeight = math.max(32, height * (height / state.contentHeight))
 		local travel = height - thumbHeight
 		local startY = -travel * (state.offset / maximum)
 
@@ -915,7 +929,8 @@ function W.ScrollPage(parent, width, height)
 
 	viewport:EnableMouseWheel(true)
 	viewport:SetScript("OnMouseWheel", function(_, delta)
-		state.offset = state.offset + (delta > 0 and 60 or -60)
+		-- Positive delta is a wheel-up notch, which scrolls toward the top of the page.
+		state.offset = state.offset - (delta or 0) * 60
 		apply()
 	end)
 
