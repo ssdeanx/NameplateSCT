@@ -1,5 +1,5 @@
-﻿## Interface: 11508, 11509
-## Version: 1.64
+## Interface: 11508, 11509
+## Version: 1.66
 ## Title: NameplateSCT
 ## Author: AcidBomb
 ## SavedVariables: NameplateSCTDB

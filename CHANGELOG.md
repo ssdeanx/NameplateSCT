@@ -1,5 +1,27 @@
 # NameplateSCT
 
+## [1.66] (2026-11-14)
+
+### Fixed: Only show heals cast by you, not random heals on everyone
+
+With `showHealing` enabled on Forever, `UNIT_COMBAT` (`HEAL`) previously drew every heal on any visible unit—other healers, potions/regen, and enemies healing themselves. And on Classic/CLEU, enabling `Show damage you take` (`personal`) also let other players' heals on you leak through.
+
+- **Player heal attribution on restricted clients (`UNIT_COMBAT`):** Track `UNIT_SPELLCAST_SENT`, `UNIT_SPELLCAST_START`, `UNIT_SPELLCAST_CHANNEL_START`, `UNIT_SPELLCAST_CHANNEL_STOP`, and `UNIT_SPELLCAST_SUCCEEDED` for your healing/helpful casts (`C_Spell.IsSpellHelpful` plus ground/AoE/channel healing spells). Unattributed heals and heals on hostile units (`UnitCanAttack`) are dropped (`"not your heal"`).
+- **HoT and channel support:** Channeled heals stay authorized until `UNIT_SPELLCAST_CHANNEL_STOP` (capped at 12s), cast/instant/AoE heals open a 2s window, and captured friendly recipients (`target`, `mouseover`, self, pet, or accessible `targetName`) keep a 15s HoT window with the cast's healing spell ID.
+- **CLEU incoming-heal guard:** `CombatFilter` now requires `playerGUID == sourceGUID` (or your own pet/guardian) for heals even when `personal` damage taken is on.
+- **Settings label:** Renamed `showHealing` in `/nsct` to **"Healing you cast"** with a clear description.
+
+## [1.65] (2026-11-14)
+
+### Fixed: Blizzard's in-world combat numbers stayed on screen on Forever
+
+1.64 turned off `Blizzard_CombatText` and four `_v2` CVars, but WoW Forever still drew in-world floating combat text from other active `floatingCombatText*` CVars (auto-attacks, pet melee/spell damage, healing, absorbs, spell mechanics, auras, and non-`_v2` aliases) and allowed other addons or post-login timing to flip them back without re-applying.
+
+- **Expanded steered CVar list:** Suppress and restore all 24 `floatingCombatText*` boolean CVars in both `_v2` and non-`_v2` forms alongside `enableFloatingCombatText`, and skip recording/restoring CVars that do not exist (`GetCVar == nil`) on the active client.
+- **Guarded against late overrides:** Watch all steered CVars case-insensitively in `CVAR_UPDATE`, and schedule deferred `C_Timer.After(0, ...)` re-application on `OnEnable`, `PLAYER_ENTERING_WORLD`, `SETTINGS_LOADED`, and `ADDON_LOADED` (`Blizzard_CombatText`).
+- **Accurate dashboard status:** Updated `GetBlizzardFCTStatus()` to verify `GetBlizzardFCTState()` across all world-text CVars even when `Blizzard_CombatText` is already unregistered.
+- **Midnight AceConfig fix:** Pass `"1"`/`"0"` strings when toggling `floatingCombatTextCombatDamage_v2` via the legacy Midnight options menu.
+
 ## [1.64] (2026-11-14)
 
 ### Fixed: turning off Blizzard's numbers did nothing visible

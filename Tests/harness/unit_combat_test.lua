@@ -177,7 +177,11 @@ canaccessvalue = function(value) return value ~= SECRET end
 
 C_Secrets = { HasSecretRestrictions = function() return true end }
 C_CombatLog = { IsCombatLogRestricted = function() return true end }
-C_Spell = { GetSpellTexture = function() return nil end }
+local helpfulSpells = { [2061] = true, [774] = true }
+C_Spell = {
+	GetSpellTexture = function() return nil end,
+	IsSpellHelpful = function(id) return helpfulSpells[id] == true end,
+}
 
 -- Nameplate anchors: a hit on "nameplate1" resolves to this frame.
 local plateFrames = {}
@@ -229,7 +233,18 @@ function UnitIsUnit(a, b)
 	return false
 end
 function UnitIsDead(unit) return false end
-function UnitExists() return true end
+function UnitExists(unit)
+	if _G.__existingUnits then return _G.__existingUnits[unit] == true end
+	return true
+end
+function UnitCanAttack(a, b)
+	if _G.__hostileUnits and a == "player" then return _G.__hostileUnits[b] == true end
+	return false
+end
+function UnitName(unit)
+	if _G.__unitNames then return _G.__unitNames[unit] end
+	return nil
+end
 -- CVars are a table now: the Blizzard combat-text family is steered, restored and checked by
 -- name, so a single stubbed answer cannot prove any of it.
 local cvarValues = { nameplateShowEnemies = "1" }
@@ -431,6 +446,15 @@ local function FireEvent(event, ...)
 	return true
 end
 
+local function FireCastEvent(event, ...)
+	local cf = NS.castFrame
+	if not (cf and cf._events and cf._events[event] and cf._scripts and cf._scripts.OnEvent) then
+		return false
+	end
+	cf._scripts.OnEvent(cf, event, ...)
+	return true
+end
+
 plateFrames["nameplate1"] = CreateFrame("Frame", "Plate1")
 
 --------------------------------------------------------------------------------
@@ -525,15 +549,32 @@ end
 ok(missText ~= nil and missText:find("Dodged") ~= nil, "a dodge renders as text", tostring(missText))
 
 --------------------------------------------------------------------------------
--- Healing is drawn, in its own colour, and can be switched off
+-- Healing is drawn only when healed by you, in its own colour, and can be switched off
 --------------------------------------------------------------------------------
 
 NS.db.profile.showHealing = true
+NS:ClearHealAttribution()
 NS.diagnostics.drawn = 0
 createdFontStrings = {}
 _G.__now = 400
+-- Unattributed heals (no heal cast by you) must never render on random players or yourself.
 FireEvent("UNIT_COMBAT", "nameplate1", "HEAL", "", 55, 0)
-eq(NS.diagnostics.drawn, 1, "healing is drawn")
+eq(NS.diagnostics.drawn, 0, "random unattributed heal on a nameplate is dropped")
+eq(NS.diagnostics.lastDrop, "not your heal", "unattributed heal records why it was dropped")
+FireEvent("UNIT_COMBAT", "player", "HEAL", "", 55, 0)
+eq(NS.diagnostics.drawn, 0, "random unattributed heal on you is also dropped")
+
+-- Offensive casts (e.g. Aimed Shot 19434) must not open heal attribution.
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", "Mob", "cast-dmg-1", 19434)
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-dmg-1", 19434)
+FireEvent("UNIT_COMBAT", "nameplate1", "HEAL", "", 55, 0)
+eq(NS.diagnostics.drawn, 0, "an offensive cast does not authorize random heals")
+
+-- Casting a heal of your own draws it cleanly.
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", SECRET, "cast-heal-1", 2061)
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-heal-1", 2061)
+FireEvent("UNIT_COMBAT", "nameplate1", "HEAL", "", 55, 0)
+eq(NS.diagnostics.drawn, 1, "healing is drawn after your heal cast (even with secret targetName)")
 
 local healText, healColor
 for _, fs in ipairs(createdFontStrings) do
@@ -543,11 +584,20 @@ ok(healText == "+55", "a heal is prefixed with +", tostring(healText))
 ok(type(healColor) == "table" and healColor[2] > healColor[1] and healColor[2] > healColor[3],
 	"a heal is green by default", healColor and tostring(healColor[2]))
 
+-- Enemy units healing themselves never render, even during your own heal window.
+plateFrames["nameplate2"] = CreateFrame("Frame", "Plate2")
+_G.__hostileUnits = { nameplate2 = true }
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "HEAL", "", 80, 0)
+eq(NS.diagnostics.drawn, 0, "an enemy heal is dropped even during your heal window")
+_G.__hostileUnits = nil
+
 -- The crit heal colour is a setting of its own.
 NS.db.profile.useHealCritColor = true
 NS.db.profile.healCritColor = "3366ff"
 createdFontStrings = {}
 _G.__now = 401
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-heal-2", 2061)
 FireEvent("UNIT_COMBAT", "nameplate1", "HEAL", "CRITICAL", 90, 0)
 local critHealColor
 for _, fs in ipairs(createdFontStrings) do
@@ -557,10 +607,54 @@ ok(type(critHealColor) == "table" and critHealColor[3] > critHealColor[2],
 	"a heal crit uses the heal crit colour", critHealColor and tostring(critHealColor[3]))
 NS.db.profile.useHealCritColor = false
 
+-- Channeled AoE heals (e.g. Tranquility 740) authorize heals while channeling and expire afterward.
+_G.__now = 410
+FireCastEvent("UNIT_SPELLCAST_CHANNEL_START", "player", "cast-chan-1", 740)
+_G.__now = 415
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "HEAL", "", 40, 0)
+eq(NS.diagnostics.drawn, 1, "channeled heal draws during channel even past 2s")
+_G.__now = 416
+FireCastEvent("UNIT_SPELLCAST_CHANNEL_STOP", "player", "cast-chan-1", 740)
+_G.__now = 419
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "HEAL", "", 40, 0)
+eq(NS.diagnostics.drawn, 0, "heal window closes after channel stops")
+
+-- Per-recipient HoT tracking: Rejuvenation on target nameplate1 keeps ticking for you at +6s,
+-- while an unhealed ally on nameplate2 at +6s is dropped.
+NS:ClearHealAttribution()
+_G.__now = 430
+_G.__unitIsTarget = "nameplate1"
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", "Tank", "cast-hot-1", 774)
+_G.__unitIsTarget = nil
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-hot-1", 774)
+_G.__now = 436
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "HEAL", "", 30, 0)
+eq(NS.diagnostics.drawn, 0, "random heal on another ally after 2s is dropped")
+FireEvent("UNIT_COMBAT", "nameplate1", "HEAL", "", 30, 0)
+eq(NS.diagnostics.drawn, 1, "your HoT tick on the healed target still draws within 15s")
+
+-- CLEU path: even with personal damage enabled, another healer's heal on you is dropped,
+-- while your own heal on yourself still draws.
+local personalBefore = NS.db.profile.personal
+NS.db.profile.personal = true
+NS.diagnostics.drawn = 0
+NS:CombatFilter(0, "SPELL_HEAL", false, "Player-2-9999", "OtherHealer", 0, 0,
+	UnitGUID("player"), "Me", 0, 0, 2061, "Flash Heal", 2, 120, 0, 0, false)
+eq(NS.diagnostics.drawn, 0, "CLEU drops heals on you from other healers even when personal is on")
+NS:CombatFilter(0, "SPELL_HEAL", false, UnitGUID("player"), "Me", 0, 0,
+	UnitGUID("player"), "Me", 0, 0, 2061, "Flash Heal", 2, 120, 0, 0, false)
+eq(NS.diagnostics.drawn, 1, "CLEU draws heals you cast on yourself")
+NS.db.profile.personal = personalBefore
+plateFrames["nameplate2"] = nil
+NS:ClearHealAttribution()
+
 -- And it can be switched off entirely.
 NS.db.profile.showHealing = false
 NS.diagnostics.drawn = 0
-_G.__now = 402
+_G.__now = 440
 FireEvent("UNIT_COMBAT", "nameplate1", "HEAL", "", 55, 0)
 eq(NS.diagnostics.drawn, 0, "healing is off when the switch is off")
 eq(NS.diagnostics.lastDrop, "healing is off", "and it says why")
@@ -1159,28 +1253,52 @@ NS.db.profile.displayMode = "nameplates"
 local family = NS.blizzardTextCVars or {}
 local master = NS.blizzardFCTMasterCVar
 eq(type(master), "string", "the master combat-text switch has a name")
-eq(#family, 4, "the addon steers the damage/avoidance family")
+ok(#family >= 40, "the addon steers the full combat-text CVar family (both _v2 and plain)")
 
 -- Start from the state the user reported: Blizzard's numbers are drawing.
+-- Stub a realistic Forever subset: the _v2 CVars plus plain ones if exposed, leaving
+-- absent CVars as nil so we also verify absent CVars are skipped cleanly.
+local activeFamily = {
+	"floatingCombatTextCombatDamage_v2",
+	"floatingCombatTextCombatDamageAllAutos_v2",
+	"floatingCombatTextCombatHealing_v2",
+	"floatingCombatTextCombatLogPeriodicSpells_v2",
+	"floatingCombatTextPetMeleeDamage_v2",
+	"floatingCombatTextPetSpellDamage_v2",
+	"floatingCombatTextDodgeParryMiss_v2",
+	"floatingCombatTextDamageReduction_v2",
+	"floatingCombatTextCombatDamage",
+}
 _G.CombatText.events = { COMBAT_TEXT_UPDATE = true }
-for _, name in ipairs(family) do cvarValues[name] = "1" end
+for _, name in ipairs(activeFamily) do cvarValues[name] = "1" end
 cvarValues[master] = "1"
 
 NS.db.profile.hideBlizzardFCT = true
 NS:ApplyBlizzardFCT()
 
 eq(cvarValues[master], "0", "the master switch this client actually reads is turned off")
+eq(cvarValues.floatingCombatTextCombatDamageAllAutos_v2, "0", "auto-attack world numbers are turned off")
+eq(cvarValues.floatingCombatTextPetMeleeDamage_v2, "0", "pet melee world numbers are turned off")
+eq(cvarValues.floatingCombatTextPetSpellDamage_v2, "0", "pet spell world numbers are turned off")
+eq(cvarValues.floatingCombatTextCombatHealing_v2, "0", "healing world numbers are turned off")
+eq(cvarValues.floatingCombatTextCombatDamage, "0", "plain combat-damage CVar is also turned off if present")
 eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), false,
-	"the client's renderer is unregistered, which is what stops damage and healing text")
+	"the client's renderer is unregistered, which is what stops self damage and healing text")
 
 _G.__blizzardNumbers = 0
 _G.__drawBlizzardText()
 eq(_G.__blizzardNumbers, 0, "a combat-text tick draws nothing once the setting is on")
 eq((NS:GetBlizzardFCTStatus()), true, "the dashboard status reads the client, not our write")
 
+-- Even with enableFloatingCombatText = "0" and CombatText unregistered, an active world
+-- combat-text CVar still counts as on, so the dashboard must not report green.
+cvarValues.floatingCombatTextCombatDamageAllAutos_v2 = "1"
+eq((NS:GetBlizzardFCTStatus()), false, "an active world-text CVar fails the status check even when master is 0")
+cvarValues.floatingCombatTextCombatDamageAllAutos_v2 = "0"
+
 -- The 1.64 bug, exactly: every CVar reads "0" and the client keeps drawing. A check that trusts
 -- the CVar goes green here; one that asks the client does not.
-for _, name in ipairs(family) do cvarValues[name] = "0" end
+for _, name in ipairs(activeFamily) do cvarValues[name] = "0" end
 _G.CombatText.events = { COMBAT_TEXT_UPDATE = true }
 eq((NS:GetBlizzardFCTStatus()), false, "a green CVar does not mean the client stopped")
 _G.__blizzardNumbers = 0
@@ -1196,7 +1314,7 @@ _G.__drawBlizzardText()
 eq(_G.__blizzardNumbers, 0, "numbers stop again")
 
 local steered, on = NS:GetBlizzardFCTState()
-eq(steered, 5, "the state helper sees the master plus the whole family")
+eq(steered, 1 + #activeFamily, "the state helper sees the master plus every exposed CVar")
 eq(on, 0, "the state helper reports nothing still drawing")
 
 -- Toggling the setting back off restores what the player had, and gives the text back.
@@ -1204,10 +1322,11 @@ NS.db.profile.hideBlizzardFCT = false
 NS:ApplyBlizzardFCT()
 eq(cvarValues[master], "1", "the master switch is handed back to the player")
 local restored = 0
-for _, name in ipairs(family) do
+for _, name in ipairs(activeFamily) do
 	if cvarValues[name] == "1" then restored = restored + 1 end
 end
-eq(restored, 4, "turning the setting off restores Blizzard's text")
+eq(restored, #activeFamily, "turning the setting off restores every steered CVar")
+eq(cvarValues.floatingCombatTextAuras_v2, nil, "absent CVars are never written on restore")
 eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), true, "the client's renderer is registered again")
 _G.__blizzardNumbers = 0
 _G.__drawBlizzardText()
@@ -1216,23 +1335,25 @@ eq(_G.__blizzardNumbers, 1, "Blizzard's numbers come back when the setting is of
 -- A CVar this client does not have is skipped, not treated as a refused write.
 NS.db.profile.hideBlizzardFCT = true
 NS:ApplyBlizzardFCT()
-cvarValues[family[4]] = nil
+local droppedVar = activeFamily[#activeFamily]
+cvarValues[droppedVar] = nil
 local steeredWithout = select(1, NS:GetBlizzardFCTState())
-eq(steeredWithout, 4, "a CVar the client does not expose is not counted")
+eq(steeredWithout, 1 + #activeFamily - 1, "a CVar the client does not expose is not counted")
 eq(NS.diagnostics.fctFailed, 0, "an absent CVar is not a failure")
+cvarValues[droppedVar] = "1"
 
 -- And nothing outside the switch is touched.
 eq(cvarValues.nameplateShowEnemies, "1", "unrelated CVars are left alone")
 
 -- A CVar the client refuses to change is reported, not silently assumed to have worked.
-for _, name in ipairs(family) do cvarValues[name] = "1" end
+for _, name in ipairs(activeFamily) do cvarValues[name] = "1" end
 NS.db.profile.hideBlizzardFCT = false
 NS:ApplyBlizzardFCT()
-_G.__refuseCvar = family[1]
+_G.__refuseCvar = activeFamily[1]
 NS.db.profile.hideBlizzardFCT = true
 NS:ApplyBlizzardFCT()
-eq(cvarValues[family[1]], "1", "a refused CVar keeps its value")
-eq(cvarValues[family[2]], "0", "the other CVars are still written")
+eq(cvarValues[activeFamily[1]], "1", "a refused CVar keeps its value")
+eq(cvarValues[activeFamily[2]], "0", "the other CVars are still written")
 eq(NS.diagnostics.fctFailed, 1, "the refused write is counted")
 eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), false,
 	"even a refused CVar leaves the renderer unregistered this session")
@@ -1278,9 +1399,8 @@ eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), false, "and is muted a
 NS.db.profile.hideBlizzardFCT = false
 NS:ApplyBlizzardFCT()
 
--- The setting stays authoritative: if the game's own options turn Blizzard's text back on
--- while the toggle is on, the addon puts it back instead of letting the player see numbers
--- return and think the setting broke.
+-- The setting stays authoritative: if the game's own options or another addon turn Blizzard's
+-- text back on while the toggle is on, the addon puts it back instead of letting numbers return.
 NS.db.profile.hideBlizzardFCT = true
 NS.db.profile.enabled = true
 NS:ApplyBlizzardFCT()
@@ -1290,6 +1410,21 @@ _G.CombatText.events = { COMBAT_TEXT_UPDATE = true }
 FireEvent("CVAR_UPDATE", master)
 eq(cvarValues[master], "0", "the master switch is put back")
 eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), false, "and the renderer is unregistered again")
+
+-- Another addon flipping a world-text CVar (while master stays "0") is also caught and reverted.
+cvarValues.floatingCombatTextCombatDamage_v2 = "1"
+cvarValues.floatingCombatTextCombatDamageAllAutos_v2 = "1"
+FireEvent("CVAR_UPDATE", "floatingCombatTextCombatDamage_v2")
+eq(cvarValues.floatingCombatTextCombatDamage_v2, "0", "a reverted damage CVar is put back to 0")
+eq(cvarValues.floatingCombatTextCombatDamageAllAutos_v2, "0", "and sibling world-text CVars are also put back")
+
+-- Late-loading Blizzard_CombatText or SETTINGS_LOADED re-asserts suppression.
+_G.CombatText.events = { COMBAT_TEXT_UPDATE = true }
+FireEvent("ADDON_LOADED", "Blizzard_CombatText")
+eq(_G.CombatText:IsEventRegistered("COMBAT_TEXT_UPDATE"), false, "late-loaded Blizzard_CombatText is unregistered")
+cvarValues.floatingCombatTextPetMeleeDamage_v2 = "1"
+FireEvent("SETTINGS_LOADED")
+eq(cvarValues.floatingCombatTextPetMeleeDamage_v2, "0", "SETTINGS_LOADED re-asserts Blizzard FCT suppression")
 
 -- The echo of our own write does not cause a second pass.
 _G.CombatText.events = {}

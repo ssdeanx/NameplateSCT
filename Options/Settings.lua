@@ -822,7 +822,8 @@ local function buildGeneral(content)
 	y = toggle(content, y, "Spell damage", "showSpellDamage")
 	y = toggle(content, y, "Ranged damage", "showRangedDamage")
 	y = toggle(content, y, "Damage over time", "showPeriodicDamage")
-	y = toggle(content, y, "Healing you and your target receive", "showHealing")
+	y = toggle(content, y, "Healing you cast", "showHealing",
+		"Only shows heals from your own healing casts on friendly targets and yourself")
 	y = toggle(content, y, "Pet damage", "showPetDamage",
 		"Only the combat log names the source, so this switch does nothing on Forever", nil,
 		usable("showPetDamage"))

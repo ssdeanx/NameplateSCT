@@ -1,7 +1,3 @@
-<div align="center">
-
-<img src="logo.png" alt="NameplateSCT" width="220">
-
 # <span style="color:#FF8D0A">NameplateSCT</span>
 
 **Your damage numbers, on the nameplate they landed on.**
@@ -214,6 +210,7 @@ The Appearance preview shows both styles side by side, so you can tune them with
    events — check the combat source line.
 3. Are enemy nameplates enabled? Nameplate mode needs them; screen mode does not.
 4. Is **Hide Blizzard's own numbers** on? That only affects Blizzard's text, not yours.
+
 </details>
 
 <details>
