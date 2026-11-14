@@ -7,7 +7,17 @@ local SharedMedia = LibStub("LibSharedMedia-3.0")
 local L = LibStub("AceLocale-3.0"):GetLocale("NameplateSCT")
 local MSQ = LibStub("Masque", true)
 
+---@class NameplateSCT : AceAddon-3.0, AceConsole-3.0, AceEvent-3.0
+---@field db any
+---@field frame Frame
+---@field W any palette and widget helpers, installed by Options/Widgets.lua
+---@field OpenDashboard (fun(self: NameplateSCT))? installed by Options/Settings.lua
 local NameplateSCT = AceAddon:NewAddon("NameplateSCT", "AceConsole-3.0", "AceEvent-3.0")
+-- AceAddon keeps the addon table in its own registry; it does NOT publish it under the
+-- addon's name. Options/Widgets.lua and Options/Settings.lua look the object up as
+-- _G.NameplateSCT, so without this line both modules return at their first statement: no
+-- palette, no dashboard, and /nsct silently falls through to the Blizzard AddOns panel.
+_G.NameplateSCT = NameplateSCT
 NameplateSCT.frame = CreateFrame("Frame", nil, UIParent)
 
 -------------------
@@ -21,15 +31,124 @@ local isForever = (WOW_PROJECT_ID == WOW_PROJECT_CAMELOT) or (build == 16001)
 local isMidnight = (build >= 120000)
 local isModernCvar = isMidnight or isForever
 local blizzardCvar = isModernCvar and "floatingCombatTextCombatDamage_v2" or "floatingCombatTextCombatDamage"
+NameplateSCT.blizzardCVar = blizzardCvar
 
-local function isSecretValue(v)
-	local issecret = _G.issecretvalue
-	if type(issecret) == "function" then
-		local ok, res = pcall(issecret, v)
-		return ok and (res == true)
-	end
-	return false
+-- issecretvalue / canaccessvalue are documented on every supported client (live, classic,
+-- classic_era, classic_anniversary and forever). Classic clients pass them through: they
+-- answer "not secret" and "accessible" without caring about taint at all, so the same code
+-- path is correct on both families. Both take one value and return one bool.
+---@secret-guard value is-secret
+---@param value any
+---@return boolean
+local function isSecretValue(value)
+	local ok, secret = pcall(issecretvalue, value)
+	-- a refused issecretvalue means "we are not allowed to know": treat it as secret
+	return (not ok) or secret == true
 end
+
+-- UnitIsUnit returns a single bool and is SecretWhenUnitComparisonRestricted; a refusal
+-- reads as "not the same unit". The second return is this helper's own contract and tells
+-- the caller whether the client answered at all.
+---@param unit1 string?
+---@param unit2 string?
+---@return boolean isTarget
+---@return boolean answered
+local function safeUnitIsUnit(unit1, unit2)
+	if not unit1 or not unit2 then return false, false end
+
+	-- UnitIsUnit returns nothing when the tokens cannot be compared
+	-- (precondition CanCompareUnitTokens), so ask that first.
+	local canCompare = C_Secrets and C_Secrets.CanCompareUnitTokens
+	if canCompare then
+		local compared, allowed = pcall(canCompare, unit1, unit2)
+		if not compared or allowed ~= true then
+			NameplateSCT.diagnostics.refused = NameplateSCT.diagnostics.refused + 1
+			return false, false
+		end
+	end
+
+	local ok, same = pcall(UnitIsUnit, unit1, unit2)
+	if not ok or not canaccessvalue(same) then
+		NameplateSCT.diagnostics.refused = NameplateSCT.diagnostics.refused + 1
+		return false, false
+	end
+	if isSecretValue(same) then return false, false end
+
+	return same == true, true
+end
+
+-- C_NamePlate.GetNamePlateForUnit only accepts tokens that can own a nameplate and raises
+-- ("Target-of-target unit tokens are not allowed for this call") on a token that names a
+-- unit's target. UNIT_COMBAT does report those aliases ("targettarget", "pettarget", ...),
+-- so they are recognised here and never reach the client.
+---@param unit string?
+---@return boolean
+local function isTargetOfTargetToken(unit)
+	if type(unit) ~= "string" or unit == "target" then return false end
+	return string.sub(unit, -6) == "target"
+end
+
+-- Resolve a unit token to its nameplate frame, or nil when the client must not be asked.
+-- A target-of-target has no plate to resolve, so a nameplate-anchored draw is skipped for
+-- it while screen mode (which needs no plate) still draws it.
+---@param unit string?
+---@return Frame?
+local function getNamePlateForUnit(unit)
+	if not unit or isSecretValue(unit) or isTargetOfTargetToken(unit) then return nil end
+	local namePlates = C_NamePlate
+	if not namePlates or not namePlates.GetNamePlateForUnit then return nil end
+	return namePlates.GetNamePlateForUnit(unit)
+end
+
+-- Does this build restrict combat events for addons? Forever and Midnight always do;
+-- other clients answer through the predicates and are unrestricted.
+local function clientHasCombatRestrictions()
+	if isForever then
+		return true
+	end
+
+	local ok, restricted = pcall(function()
+		return (C_Secrets and C_Secrets.HasSecretRestrictions and C_Secrets.HasSecretRestrictions())
+			or (C_CombatLog and C_CombatLog.IsCombatLogRestricted and C_CombatLog.IsCombatLogRestricted())
+	end)
+
+	return ok and restricted == true
+end
+
+local hasCombatRestrictions = clientHasCombatRestrictions()
+
+NameplateSCT.hasCombatRestrictions = hasCombatRestrictions
+
+-- Live counters read by the options dashboard, so "no numbers" can be diagnosed instead of
+-- guessed: a counter that never moves points at the event source, not at the styling.
+NameplateSCT.diagnostics = {
+	path = hasCombatRestrictions and "unit" or "cleu",
+	event = hasCombatRestrictions and "UNIT_COMBAT" or "COMBAT_LOG_EVENT_UNFILTERED",
+	events = 0,
+	drawn = 0,
+	misses = 0,
+	secret = 0,
+	duplicates = 0,
+	refused = 0,
+	lastEvent = 0,
+	lastDraw = 0,
+	lastDropAt = 0,
+	lastDrop = nil,
+	dropped = {},
+	startedAt = 0,
+}
+
+-- Drop accounting: every early return in the combat paths records why, so "events arrive but
+-- nothing is drawn" can be answered with a reason instead of a guess.
+---@param reason string
+local function countDrop(reason)
+	local d = NameplateSCT.diagnostics
+	if not d then return end
+	d.dropped[reason] = (d.dropped[reason] or 0) + 1
+	d.lastDrop = reason
+	d.lastDropAt = GetTime()
+end
+NameplateSCT.countDrop = countDrop
 
 ------------
 -- LOCALS --
@@ -45,14 +164,6 @@ local playerGUID
 local unitToGuid = {}
 local guidToUnit = {}
 
-local function rgbToHex(r, g, b)
-	return string.format("%02x%02x%02x", math.floor(255 * r), math.floor(255 * g), math.floor(255 * b))
-end
-
-local function hexToRGB(hex)
-	return tonumber(hex:sub(1,2), 16)/255, tonumber(hex:sub(3,4), 16)/255, tonumber(hex:sub(5,6), 16)/255, 1
-end
-
 local animationValues = {
 	-- ["shake"] = L["Shake"],
 	["verticalUp"] = L["Vertical Up"],
@@ -61,42 +172,6 @@ local animationValues = {
 	["rainfall"] = L["Rainfall"],
 	["fireworks"] = L["Fireworks"],
 	["disabled"] = L["Disabled"]
-}
-
-local fontFlags = {
-	[""] = L["None"],
-	["OUTLINE"] = L["Outline"],
-	["THICKOUTLINE"] = L["Thick Outline"],
-	["nil, MONOCHROME"] = L["Monochrome"],
-	["OUTLINE , MONOCHROME"] = L["Monochrome Outline"],
-	["THICKOUTLINE , MONOCHROME"] = L["Monochrome Thick Outline"]
-}
-
-local stratas = {
-	[1] = L["Background"],
-	[2] = L["Low"],
-	[3] = L["Medium"],
-	[4] = L["High"],
-	[5] = L["Dialog"],
-	[6] = L["Tooltip"]
-}
-
-local positionValues = {
-	["TOP"] = L["Top"],
-	["RIGHT"] = L["Right"],
-	["BOTTOM"] = L["Bottom"],
-	["LEFT"] = L["Left"],
-	["TOPRIGHT"] = L["Top Right"],
-	["TOPLEFT"] = L["Top Left"],
-	["BOTTOMRIGHT"] = L["Bottom Right"],
-	["BOTTOMLEFT"] = L["Bottom Left"],
-	["CENTER"]  = L["Center"]
-}
-
-local truncateMethod = {
-	['NONE'] = L["Do Not Truncate"],
-	['WESTERN'] = L["Western"],
-	['EASTASIA'] = L["East Asia"],
 }
 
 local inversePositions = {
@@ -115,6 +190,7 @@ local inversePositions = {
 -- DB --
 --------
 if MSQ then
+    ---@type any
     NameplateSCT.frame.MSQGroup = MSQ:Group("NameplateSCT")
 end
 
@@ -123,13 +199,18 @@ if (SharedMedia:IsValid("font", "Bazooka")) then
 	defaultFont = "Bazooka"
 end
 
+-- Settings live in the AceDB *profile* namespace, so AceDB profiles (and AceDBOptions)
+-- actually do something. `global` would be a single shared table across every profile.
 local defaults = {
-	global = {
+	profile = {
 		enabled = true,
 		shouldDisplayOverkill = false,
 		showAbsorbDamage = true,
 		xOffset = 0,
 		yOffset = 0,
+		-- Show numbers on your own nameplate for damage you take. Off keeps the same
+		-- behaviour the combat-log path has always had with an unset value.
+		personal = false,
 		personalOnly = false,
 		xOffsetPersonal = 0,
 		yOffsetPersonal = -100,
@@ -142,7 +223,17 @@ local defaults = {
 
 		font = defaultFont,
 		fontFlag = "OUTLINE",
-		fontShadow = false,
+		textShadow = false,
+		-- A drop shadow drawn as a second FontString under the number. The client's own
+		-- SetShadowOffset is a fixed 1px copy: no size, distance, angle or colour. The
+		-- defaults here reproduce exactly that old 1px black shadow.
+		shadow = {
+			size = 1,
+			distance = 1.5,
+			angle = 315,
+			color = "000000",
+			alpha = 1,
+		},
 		damageColor = true,
 		defaultColor = "ffff00",
 		useCritColor = false,
@@ -151,6 +242,8 @@ local defaults = {
 		missColor = "ffffff",
 
 		showIcon = true,
+		showIconOnly = false,
+		removeBorder = false,
 		enableMSQ = true,
 		iconScale = 1,
 		iconPosition = "RIGHT",
@@ -204,6 +297,21 @@ local defaults = {
 			alpha = 1,
 		},
 
+		-- Where numbers are drawn. "nameplates" anchors each number to its plate,
+		-- "screen" anchors it to a fixed area on screen (the mode PlateSCT offers).
+		displayMode = "nameplates",
+		screen = {
+			outgoingX = 0, outgoingY = -140,
+			incomingX = 0, incomingY = 110,
+		},
+
+		-- Suppress hits below this value outright (independent of the relative
+		-- small-hit scaling below).
+		minDamage = 0,
+		showMisses = true,
+		-- Blizzard also draws nameplate damage numbers; leave both on and they double up.
+		hideBlizzardFCT = true,
+
 		useOffTargetAppearance = true,
 		displayOffTargetText = true,
 		offTargetFormatting = {
@@ -218,10 +326,13 @@ local defaults = {
 	},
 }
 
+-- The settings window resets one page at a time from this schema.
+NameplateSCT.defaults = defaults
+
 local filtersTable = {}
 
 function NameplateSCT:updateFilterTable(filterData)
-	NameplateSCT.db.global.filter = filterData
+	NameplateSCT.db.profile.filter = filterData
 	local splitData = {strsplit("\n", filterData)}
 	filtersTable = {}
 	for _, spellInfo in ipairs(splitData) do
@@ -232,7 +343,7 @@ end
 local npcFiltersTable = {}
 
 function NameplateSCT:updateNPCFilterTable(npcFilterData)
-	NameplateSCT.db.global.npcFilter = npcFilterData
+	NameplateSCT.db.profile.npcFilter = npcFilterData
 	local splitData = {strsplit("\n", npcFilterData)}
 	npcFiltersTable = {}
 	for _, npcId in ipairs(splitData) do
@@ -326,6 +437,19 @@ local MISS_EVENT_STRINGS = {
 	["RESIST"] = L["Resisted"],
 }
 
+
+-- UnitIsDead is "AllowedWhenUntainted" on restricted clients and this is called from the
+-- animation OnUpdate: a raise here would error every frame and stop all drawing, so an
+-- unanswerable query is treated as "alive" and the number keeps animating.
+local function safeUnitIsDead(unit)
+	if not unit then return false end
+	local ok, dead = pcall(UnitIsDead, unit)
+	if not ok or isSecretValue(dead) then
+		return false
+	end
+	return dead == true
+end
+
 local STRATAS = {
 	"BACKGROUND",
 	"LOW",
@@ -335,16 +459,87 @@ local STRATAS = {
 	"TOOLTIP"
 }
 
+-- Exported for Options/Widgets.lua and Options/Settings.lua (loaded after this file).
+NameplateSCT.animationValues = animationValues
+NameplateSCT.strataNames = STRATAS
+
 ----------------
 -- FONTSTRING --
 ----------------
+local fontPathCache = {}
+
+---@param fontName string?
+---@return string
 local function getFontPath(fontName)
-	local fontPath = SharedMedia:Fetch("font", fontName)
+	-- nil is a legal setting value, so it must never become a table key
+	local key = fontName or ""
+	local cached = fontPathCache[key]
+	if cached then return cached end
+
+	local fontPath = SharedMedia:Fetch("font", key)
 	if (fontPath == nil) then
-		fontPath = "Fonts\\FRIZQT__.TTF"
+		-- The client's own default font, which is also correct on CJK and Cyrillic locales
+		-- where FRIZQT has no glyphs. "Friz Quadrata TT" resolves through SharedMedia first.
+		fontPath = STANDARD_TEXT_FONT or "Fonts\\FRIZQT__.TTF"
 	end
+
+	fontPathCache[key] = fontPath
 	return fontPath
 end
+
+-- A changed font must resolve again (the empty key covers a nil setting).
+function NameplateSCT:ResetFontPathCache()
+	fontPathCache = {}
+end
+
+---@param hex string
+---@return number, number, number
+local function hexToRGB(hex)
+	-- Defensive: a profile edited by hand can hold a number where a colour used to be.
+	if type(hex) ~= "string" or #hex < 6 then return 0, 0, 0 end
+	return (tonumber(hex:sub(1, 2), 16) or 0) / 255,
+		(tonumber(hex:sub(3, 4), 16) or 0) / 255,
+		(tonumber(hex:sub(5, 6), 16) or 0) / 255
+end
+
+-- The shadow is a second FontString under the number. It carries the same string - a secret
+-- amount is passed to both sinks by identity and never formatted - and takes its own size,
+-- distance, angle, colour and opacity. Exactly one shadow is ever drawn: while the custom
+-- one is on, the client's own offset copy is switched off.
+---@param fontString FontString
+---@param size number?
+local function applyShadow(fontString, size)
+	local shadow = fontString.shadow
+	if not shadow then return end
+
+	local profile = NameplateSCT.db.profile
+	if not profile.textShadow then
+		fontString:SetShadowOffset(0, 0)
+		shadow:SetAlpha(0)
+		return
+	end
+
+	fontString:SetShadowOffset(0, 0)
+
+	local textSize = (size or fontString.NSCTFontSize or 15) * (profile.shadow.size or 1)
+	local distance = profile.shadow.distance or 0
+	local angle = math.rad(profile.shadow.angle or 315)
+
+	shadow:SetFont(getFontPath(profile.font), textSize, profile.fontFlag)
+	shadow:SetText(fontString.NSCTText or "")
+	local red, green, blue = hexToRGB(profile.shadow.color or "000000")
+	shadow:SetTextColor(red, green, blue)
+	shadow:SetAlpha((fontString:GetAlpha() or 1) * (profile.shadow.alpha or 1))
+	shadow:ClearAllPoints()
+	shadow:SetPoint("CENTER", fontString, "CENTER",
+		distance * math.cos(angle), distance * math.sin(angle))
+	shadow:Show()
+end
+
+-- Exported for the settings window, which renders its own preview with the same rules.
+NameplateSCT.GetFontPath = getFontPath
+NameplateSCT.hexToRGB = hexToRGB
+NameplateSCT.applyShadow = applyShadow
 
 local fontStringCache = {}
 local frameCounter = 0
@@ -356,30 +551,36 @@ local function getFontString()
 	else
 		frameCounter = frameCounter + 1
 		fontStringFrame = CreateFrame("Frame", nil, UIParent)
-		fontStringFrame:SetFrameStrata(NameplateSCT:GetStrata(NameplateSCT.db.global.strata.target))
+		fontStringFrame:SetFrameStrata(NameplateSCT:GetStrata(NameplateSCT.db.profile.strata.target))
 		fontStringFrame:SetFrameLevel(frameCounter)
 		fontString = fontStringFrame:CreateFontString()
 		fontString:SetParent(fontStringFrame)
 	end
 
-	fontString:SetFont(getFontPath(NameplateSCT.db.global.font), 15, NameplateSCT.db.global.fontFlag)
-	if NameplateSCT.db.global.textShadow then fontString:SetShadowOffset(1,-1) else fontString:SetShadowOffset(0, 0) end
+	fontString:SetFont(getFontPath(NameplateSCT.db.profile.font), 15, NameplateSCT.db.profile.fontFlag)
 	fontString:SetAlpha(1)
 	fontString:SetDrawLayer("OVERLAY")
 	fontString:SetText("")
+
+	-- One shadow region per number, one layer under the text.
+	if not fontString.shadow then
+		fontString.shadow = fontString:GetParent():CreateFontString(nil, "ARTWORK")
+	end
+	applyShadow(fontString)
+
 	fontString:Show()
 
-	if NameplateSCT.db.global.showIcon then
+	if NameplateSCT.db.profile.showIcon then
 		local frame = fontString:GetParent()
 		if not fontString.icon then
 			fontString.icon = frame:CreateTexture(nil, "OVERLAY")
 		end
 		fontString.icon:SetAlpha(1)
 		fontString.icon:SetTexture("Interface\\Icons\\INV_Misc_QuestionMark")
-		if NameplateSCT.db.global.removeBorder then fontString.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92) end
+		if NameplateSCT.db.profile.removeBorder then fontString.icon:SetTexCoord(0.08, 0.92, 0.08, 0.92) end
 		fontString.icon:Hide()
 
-		if MSQ and NameplateSCT.db.global.enableMSQ then
+		if MSQ and NameplateSCT.db.profile.enableMSQ then
 			if not fontString.icon.button then
 				local button = CreateFrame("Button", nil, fontStringFrame)
 				button:EnableMouse(false)
@@ -420,10 +621,17 @@ local function recycleFontString(fontString)
 
 	fontString.unit = nil
 	fontString.guid = nil
+	fontString.NSCTText = nil
 
 	fontString.pow = nil
 	fontString.startHeight = nil
 	fontString.NSCTFontSize = nil
+	fontString.strata = nil
+	fontString.screenMode = nil
+	fontString.targetCheckedAt = nil
+	fontString.targetValue = nil
+	fontString.deadCheckedAt = nil
+	fontString.deadValue = nil
 
 	if fontString.icon then
 		fontString.icon:ClearAllPoints()
@@ -440,60 +648,154 @@ local function recycleFontString(fontString)
 		fontString.icon.guid = nil
 	end
 
-	fontString:SetFont(getFontPath(NameplateSCT.db.global.font), 15, NameplateSCT.db.global.fontFlag)
-	if NameplateSCT.db.global.textShadow then fontString:SetShadowOffset(1,-1) else fontString:SetShadowOffset(0, 0) end
+	fontString:SetFont(getFontPath(NameplateSCT.db.profile.font), 15, NameplateSCT.db.profile.fontFlag)
+	fontString:SetShadowOffset(0, 0)
+	if fontString.shadow then
+		fontString.shadow:SetAlpha(0)
+		fontString.shadow:Hide()
+	end
 	fontString:ClearAllPoints()
 
 	table.insert(fontStringCache, fontString)
+end
+
+-- Diagnostics read this to show pool pressure without reaching into the locals above.
+---@return number pooled, number active
+function NameplateSCT:GetPoolStats()
+	local active = 0
+	for _ in pairs(animating) do active = active + 1 end
+	return #fontStringCache, active
+end
+
+--------------------------------------------------------------------------------
+-- DISPLAY MODE: nameplates vs a fixed screen area
+--------------------------------------------------------------------------------
+-- Screen mode anchors every number to one of two invisible frames instead of a plate,
+-- which is the behaviour PlateSCT exposes as its "screen" layout. The frames are 1x1
+-- children of UIParent so the existing animation code needs no special case beyond
+-- skipping the per-target offsets.
+
+function NameplateSCT:GetScreenAnchor(incoming)
+	local global = self.db.profile
+	local key = incoming and "incoming" or "outgoing"
+	self.screenAnchors = self.screenAnchors or {}
+
+	local anchor = self.screenAnchors[key]
+	if not anchor then
+		anchor = CreateFrame("Frame", nil, UIParent)
+		anchor:SetSize(1, 1)
+		self.screenAnchors[key] = anchor
+	end
+
+	local area = global.screen or {}
+	anchor:ClearAllPoints()
+	anchor:SetPoint("CENTER", UIParent, "CENTER", area[key .. "X"] or 0, area[key .. "Y"] or 0)
+	return anchor
+end
+
+function NameplateSCT:RefreshScreenAnchors()
+	if not self.screenAnchors then return end
+	for key, anchor in pairs(self.screenAnchors) do
+		local area = self.db.profile.screen or {}
+		anchor:ClearAllPoints()
+		anchor:SetPoint("CENTER", UIParent, "CENTER", area[key .. "X"] or 0, area[key .. "Y"] or 0)
+	end
+end
+
+function NameplateSCT:IsScreenMode()
+	return self.db and self.db.profile and self.db.profile.displayMode == "screen"
+end
+
+-- Blizzard's own nameplate damage numbers double up with ours. Only ever steer the one
+-- CVar this addon is responsible for, and only while nameplate mode is active.
+function NameplateSCT:ApplyBlizzardFCT()
+	if not self.db then return end
+	local global = self.db.profile
+	if not global.hideBlizzardFCT then return end
+	if global.displayMode ~= "nameplates" then return end
+
+	local cvar = blizzardCvar
+	if not cvar then return end
+	local ok = pcall(SetCVar, cvar, 0)
+	if not ok then pcall(SetCVar, cvar, "0") end
 end
 
 ----------------
 -- NAMEPLATES --
 ----------------
 
-local function adjustStrata()
-	local offStrata
-
-	if (NameplateSCT.db.global.modOffTargetStrata) then
-		return
-	end
-
-	if (NameplateSCT.db.global.strata.target == 1) then -- Background
-		NameplateSCT.db.global.strata.offTarget = 1
-		return
-	else
-		for k, v in ipairs(STRATAS) do
-			if (k == NameplateSCT.db.global.strata.target) then
-				offStrata = k - 1
-			end
-		end
-	end
-
-	NameplateSCT.db.global.strata.offTarget = offStrata
-end
-
+---@param strataNumber any
+---@return string
 function NameplateSCT:GetStrata(strataNumber)
-	if type(strataNumber) == "number" then
+	if type(strataNumber) == "number" and STRATAS[strataNumber] then
 		return STRATAS[strataNumber]
 	end
+	return "MEDIUM"
 end
 
 ----------
 -- CORE --
 ----------
 
+-- AceDB used to keep every setting in the shared `global` namespace, which made profiles
+-- (and therefore AceDBOptions) meaningless. Settings now live in `profile`. Copy the old
+-- values across exactly once, on the raw saved variable, and keep the legacy table as a
+-- recovery copy rather than deleting the player's settings.
+local function copyValue(value)
+	if type(value) ~= "table" then return value end
+	local copy = {}
+	for key, item in pairs(value) do copy[key] = copyValue(item) end
+	return copy
+end
+
+-- Copy a legacy value into the live profile. A nested table is merged key by key: assigning
+-- it whole would replace the default subtree, so every key the old saved data did not
+-- mention (added by a later version) would be nil afterwards - the settings window then
+-- shows blanks and the render path reads nil.
+local function mergeInto(target, key, value)
+	local existing = target[key]
+	if type(value) == "table" and type(existing) == "table" then
+		for nestedKey, nestedValue in pairs(value) do
+			mergeInto(existing, nestedKey, nestedValue)
+		end
+	else
+		target[key] = copyValue(value)
+	end
+end
+
+local function migrateSettingsToProfile(db, savedVariableName)
+	local saved = rawget(_G, savedVariableName)
+	if type(saved) ~= "table" or saved.settingsNamespace == "profile" then
+		return false
+	end
+
+	local legacy = saved.global
+	if type(legacy) == "table" then
+		for key, value in pairs(legacy) do
+			mergeInto(db.profile, key, value)
+		end
+	end
+
+	-- Runs once per account: written onto the saved variable, so it survives the profile
+	-- being switched, copied or reset later.
+	saved.settingsNamespace = "profile"
+	return type(legacy) == "table"
+end
+
+NameplateSCT.migrateSettingsToProfile = migrateSettingsToProfile
+
 function NameplateSCT:ConvertDB()
-	if type(NameplateSCT.db.global.strata.offTarget) == "string" then
+	if type(NameplateSCT.db.profile.strata.offTarget) == "string" then
 		for k, v in ipairs(STRATAS) do
-			if (v == NameplateSCT.db.global.strata.offTarget) then
-				NameplateSCT.db.global.strata.offTarget = k
+			if (v == NameplateSCT.db.profile.strata.offTarget) then
+				NameplateSCT.db.profile.strata.offTarget = k
 			end
 		end
 	end
-	if type(NameplateSCT.db.global.strata.target) == "string" then
+	if type(NameplateSCT.db.profile.strata.target) == "string" then
 		for k, v in ipairs(STRATAS) do
-			if (v == NameplateSCT.db.global.strata.target) then
-				NameplateSCT.db.global.strata.target = k
+			if (v == NameplateSCT.db.profile.strata.target) then
+				NameplateSCT.db.profile.strata.target = k
 			end
 		end
 	end
@@ -502,6 +804,7 @@ end
 function NameplateSCT:OnInitialize()
 	-- setup db
 	self.db = LibStub("AceDB-3.0"):New("NameplateSCTDB", defaults, true)
+	self.migratedSettings = migrateSettingsToProfile(self.db, "NameplateSCTDB")
 
 	-- Adjust anything that was edited in the db to be correct
 	self:ConvertDB()
@@ -513,12 +816,30 @@ function NameplateSCT:OnInitialize()
 	self:RegisterMenu()
 
 	-- Update Filters
-	self:updateFilterTable(self.db.global.filter)
-	self:updateNPCFilterTable(self.db.global.npcFilter)
+	self:updateFilterTable(self.db.profile.filter)
+	self:updateNPCFilterTable(self.db.profile.npcFilter)
 
 	-- if the addon is turned off in db, turn it off
-	if (self.db.global.enabled == false) then
+	if (self.db.profile.enabled == false) then
 		self:Disable()
+	end
+end
+
+-- AceEvent provides RegisterEvent and RegisterMessage but no unit-filtered variant, so
+-- that registration needs a plain frame. The previous attempt went through the addon
+-- object inside a pcall, failed silently, and never registered anything.
+function NameplateSCT:RegisterCastAttribution()
+	if not self.castFrame then
+		self.castFrame = CreateFrame("Frame")
+		self.castFrame:SetScript("OnEvent", function(_, event, ...)
+			NameplateSCT:UNIT_SPELLCAST_SUCCEEDED(event, ...)
+		end)
+	end
+
+	local castFrame = self.castFrame
+	local ok = pcall(castFrame.RegisterUnitEvent, castFrame, "UNIT_SPELLCAST_SUCCEEDED", "player", "pet")
+	if not ok then
+		pcall(castFrame.RegisterEvent, castFrame, "UNIT_SPELLCAST_SUCCEEDED")
 	end
 end
 
@@ -528,24 +849,42 @@ function NameplateSCT:OnEnable()
 	self:RegisterEvent("NAME_PLATE_UNIT_ADDED")
 	self:RegisterEvent("NAME_PLATE_UNIT_REMOVED")
 
-	local isRestricted = (C_CombatLog and C_CombatLog.IsCombatLogRestricted and C_CombatLog.IsCombatLogRestricted())
-		or (C_Secrets and C_Secrets.HasSecretRestrictions and C_Secrets.HasSecretRestrictions())
-
-	if not isRestricted then
+	if hasCombatRestrictions then
+		-- Restricted client (Forever / Midnight): UNIT_COMBAT is the only permitted
+		-- damage source. Spell attribution comes from the player's own casts.
+		self:RegisterEvent("UNIT_COMBAT")
+		self:RegisterCastAttribution()
+	else
 		pcall(self.RegisterEvent, self, "COMBAT_LOG_EVENT_UNFILTERED")
 	end
 
-	self.db.global.enabled = true
+	self.db.profile.enabled = true
+
+	-- The dashboard reports whether the event source is actually subscribed, which is the
+	-- difference between "no damage yet" and "nothing is listening".
+	local diagnostics = self.diagnostics
+	if diagnostics then
+		diagnostics.registered = true
+		diagnostics.startedAt = GetTime()
+		diagnostics.event = hasCombatRestrictions and "UNIT_COMBAT" or "COMBAT_LOG_EVENT_UNFILTERED"
+	end
+
+	self:ApplyBlizzardFCT()
 end
 
 function NameplateSCT:OnDisable()
 	self:UnregisterAllEvents()
+	if self.diagnostics then self.diagnostics.registered = false end
+
+	if self.castFrame then
+		self.castFrame:UnregisterAllEvents()
+	end
 
 	for fontString, _ in pairs(animating) do
 		recycleFontString(fontString)
 	end
 
-	self.db.global.enabled = false
+	self.db.profile.enabled = false
 end
 
 
@@ -657,53 +996,102 @@ local function GetLinearEasing(p)
 	return linearPoints[#linearPoints][2]
 end
 
+-- Caching rule for restricted clients: only the *plain answer* is ever cached. A secret
+-- or refused value is converted to a safe boolean by safeUnitIsUnit / safeUnitIsDead and
+-- that boolean is what gets stored, so no secret is held, compared, concatenated or
+-- formatted later. The short TTL means a cached answer cannot outlive a restriction change.
+local TARGET_CACHE_SECONDS = 0.2
+local DEAD_CACHE_SECONDS = 0.25
+
+local function fontStringTargetState(fontString, now)
+	if fontString.targetCheckedAt and (now - fontString.targetCheckedAt) < TARGET_CACHE_SECONDS then
+		return fontString.targetValue
+	end
+	-- safeUnitIsUnit yields a plain boolean: a secret answer never reaches this cache.
+	local isTarget = safeUnitIsUnit(fontString.unit, "target")
+	fontString.targetCheckedAt = now
+	fontString.targetValue = isTarget
+	return isTarget
+end
+
+local function fontStringDeadState(fontString, now)
+	if fontString.deadCheckedAt and (now - fontString.deadCheckedAt) < DEAD_CACHE_SECONDS then
+		return fontString.deadValue
+	end
+	-- same contract: the refused/secrets case collapses to false before it is stored
+	local isDead = safeUnitIsDead(fontString.unit)
+	fontString.deadCheckedAt = now
+	fontString.deadValue = isDead
+	return isDead
+end
+
 local function AnimationOnUpdate()
 	if (next(animating)) then
 		for fontString, _ in pairs(animating) do
-			local elapsed = GetTime() - fontString.animatingStartTime
-			if (elapsed > fontString.animatingDuration) then
-				-- the animation is over
+			local now = GetTime()
+			local duration = fontString.animatingDuration
+			local elapsed = now - fontString.animatingStartTime
+			if (not duration) or duration <= 0 or elapsed > duration then
+				-- the animation is over (a zero duration would divide by zero below)
 				recycleFontString(fontString)
 			else
-				local isTarget = false
-				if fontString.unit then
-					isTarget = UnitIsUnit(fontString.unit, "target")
-				else
+				if not fontString.unit then
 					fontString.unit = "player"
 				end
 
-				-- frame level
+				-- Both queries are restricted on Forever and raise there, so they are cached:
+				-- asking UnitIsUnit/UnitIsDead for every number on every frame was the hottest
+				-- path in the addon.
+				local isTarget = fontStringTargetState(fontString, now)
+
+				-- frame level: only when it actually changes
 				local frame = fontString:GetParent()
 				local strataRequired
-				if canaccessvalue(isTarget) and isTarget then
-					strataRequired = NameplateSCT:GetStrata(NameplateSCT.db.global.strata.target)
+				if isTarget then
+					strataRequired = NameplateSCT:GetStrata(NameplateSCT.db.profile.strata.target)
 				else
-					strataRequired = NameplateSCT:GetStrata(NameplateSCT.db.global.strata.offTarget)
+					local offTargetStrata = NameplateSCT.db.profile.strata.offTarget
+					if NameplateSCT.db.profile.modOffTargetStrata then
+						-- Keep off-target text one layer under the target's, whatever the
+						-- explicit off-target setting says.
+						local targetStrata = tonumber(NameplateSCT.db.profile.strata.target) or 1
+						offTargetStrata = math.max(1, targetStrata - 1)
+					end
+					strataRequired = NameplateSCT:GetStrata(offTargetStrata)
 				end
-				frame:SetFrameStrata(strataRequired)
+				if fontString.strata ~= strataRequired then
+					frame:SetFrameStrata(strataRequired)
+					fontString.strata = strataRequired
+				end
 
 				-- alpha
-				local startAlpha = NameplateSCT.db.global.formatting.alpha
-				if canaccessvalue(isTarget) then
-					if (NameplateSCT.db.global.useOffTargetAppearance and not isTarget and fontString.unit ~= "player") then
-						startAlpha = NameplateSCT.db.global.offTargetFormatting.alpha
-					end
+				local startAlpha = NameplateSCT.db.profile.formatting.alpha
+				if (NameplateSCT.db.profile.useOffTargetAppearance and not isTarget and fontString.unit ~= "player") then
+					startAlpha = NameplateSCT.db.profile.offTargetFormatting.alpha
 				end
 
 				local alpha = LibEasing.InExpo(elapsed, startAlpha, -startAlpha, fontString.animatingDuration)
 				if alpha > 1 then alpha = 1 elseif alpha < 0 then alpha = 0 end -- avoid rare occurences of eg: 1.0003 from the Lib being used to set Alpha
 				fontString:SetAlpha(alpha)
+				if fontString.shadow then
+					-- The shadow fades with the text, never on its own.
+					if NameplateSCT.db.profile.textShadow then
+						fontString.shadow:SetAlpha(alpha * (NameplateSCT.db.profile.shadow.alpha or 1))
+					else
+						fontString.shadow:SetAlpha(0)
+					end
+				end
 
 				-- sizing
 				if (fontString.pow) then
-					local iconScale = NameplateSCT.db.global.iconScale
+					local iconScale = NameplateSCT.db.profile.iconScale
 					local height = fontString.startHeight
 					if (elapsed < fontString.animatingDuration/6) then
 						fontString:SetText(fontString.NSCTText)
 						local size = powSizing(elapsed, fontString.animatingDuration/6, height/2, height*2, height)
 						fontString:SetTextHeight(size)
 						if fontString.icon then
-							if MSQ and NameplateSCT.db.global.enableMSQ then
+							if MSQ and NameplateSCT.db.profile.enableMSQ then
 								fontString.icon.button:SetSize(size*iconScale, size*iconScale)
 							else
 								fontString.icon:SetSize(size*iconScale, size*iconScale)
@@ -712,11 +1100,11 @@ local function AnimationOnUpdate()
 					else
 						fontString.pow = nil
 						fontString:SetTextHeight(height)
-						fontString:SetFont(getFontPath(NameplateSCT.db.global.font), fontString.NSCTFontSize, NameplateSCT.db.global.fontFlag)
-						if NameplateSCT.db.global.textShadow then fontString:SetShadowOffset(1,-1) else fontString:SetShadowOffset(0, 0) end
+						fontString:SetFont(getFontPath(NameplateSCT.db.profile.font), fontString.NSCTFontSize, NameplateSCT.db.profile.fontFlag)
+						applyShadow(fontString)
 						fontString:SetText(fontString.NSCTText)
 						if fontString.icon then
-							if MSQ and NameplateSCT.db.global.enableMSQ then
+							if MSQ and NameplateSCT.db.profile.enableMSQ then
 								fontString.icon.button:SetSize(height*iconScale, height*iconScale)
 							else
 								fontString.icon:SetSize(height*iconScale, height*iconScale)
@@ -746,22 +1134,26 @@ local function AnimationOnUpdate()
 					local distance = (fontString.fireworksDistance or 100) * easedProgress
 
 					-- Get the configured starting radius
-					local startRadius = NameplateSCT.db.global.animations.fireworksRadius
+					local startRadius = NameplateSCT.db.profile.animations.fireworksRadius
 					xOffset = (startRadius + distance) * math.cos(angle)
 					yOffset = (startRadius + distance) * math.sin(angle)
 				-- elseif (fontString.animation == "shake") then
 					-- TODO
 				end
 
-				if ((not UnitIsDead(fontString.unit) or fontString.unit == "player") and fontString.anchorFrame and fontString.anchorFrame:IsShown()) then
+				if ((not fontStringDeadState(fontString, now) or fontString.unit == "player") and fontString.anchorFrame and fontString.anchorFrame:IsShown()) then
 					if fontString.animation == "fireworks" then
 						-- -- Fireworks effect ignores global offset and random jitter, always relative to center
 						fontString:SetPoint("CENTER", fontString.anchorFrame, "CENTER", xOffset, yOffset)
+					elseif fontString.screenMode then
+						-- Screen mode: the anchor is already the configured area, so only the
+						-- jitter applies.
+						fontString:SetPoint("CENTER", fontString.anchorFrame, "CENTER", xOffset + randomX[fontString], yOffset + randomY[fontString])
 					else
 						if fontString.unit == "player" then -- player frame
-							fontString:SetPoint("CENTER", fontString.anchorFrame, "CENTER", NameplateSCT.db.global.xOffsetPersonal + xOffset + randomX[fontString], NameplateSCT.db.global.yOffsetPersonal + yOffset + randomY[fontString]) -- Only allows for adjusting vertical offset
+							fontString:SetPoint("CENTER", fontString.anchorFrame, "CENTER", NameplateSCT.db.profile.xOffsetPersonal + xOffset + randomX[fontString], NameplateSCT.db.profile.yOffsetPersonal + yOffset + randomY[fontString]) -- Only allows for adjusting vertical offset
 						else -- nameplate frames
-							fontString:SetPoint("CENTER", fontString.anchorFrame, "CENTER", NameplateSCT.db.global.xOffset + xOffset + randomX[fontString], NameplateSCT.db.global.yOffset + yOffset + randomY[fontString])
+							fontString:SetPoint("CENTER", fontString.anchorFrame, "CENTER", NameplateSCT.db.profile.xOffset + xOffset + randomX[fontString], NameplateSCT.db.profile.yOffset + yOffset + randomY[fontString])
 						end
 					end
 				else
@@ -769,7 +1161,7 @@ local function AnimationOnUpdate()
 				end
 			end
 		end
-		if MSQ and NameplateSCT.db.global.enableMSQ then
+		if MSQ and NameplateSCT.db.profile.enableMSQ then
 			NameplateSCT.frame.MSQGroup:ReSkin()
 		end
 	else
@@ -810,8 +1202,8 @@ function NameplateSCT:Animate(fontString, anchorFrame, duration, animation)
 	end
 
 	animating[fontString] = true
-	randomX[fontString] = NameplateSCT.db.global.xVariance > 0 and math.random(-NameplateSCT.db.global.xVariance, NameplateSCT.db.global.xVariance) or 0
-	randomY[fontString] = NameplateSCT.db.global.yVariance > 0 and math.random(-NameplateSCT.db.global.yVariance, NameplateSCT.db.global.yVariance) or 0
+	randomX[fontString] = NameplateSCT.db.profile.xVariance > 0 and math.random(-NameplateSCT.db.profile.xVariance, NameplateSCT.db.profile.xVariance) or 0
+	randomY[fontString] = NameplateSCT.db.profile.yVariance > 0 and math.random(-NameplateSCT.db.profile.yVariance, NameplateSCT.db.profile.yVariance) or 0
 
 	-- start onupdate if it's not already running
 	if (NameplateSCT.frame:GetScript("OnUpdate") == nil) then
@@ -855,20 +1247,26 @@ function NameplateSCT:NAME_PLATE_UNIT_REMOVED(event, unitID)
 end
 
 function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, destGUID, _, _, _, ...)
-    if not clue or isSecretValue(clue) or isSecretValue(sourceGUID) or isSecretValue(destGUID) then return end
+	local d = NameplateSCT.diagnostics
+	if d then d.events = d.events + 1; d.lastEvent = GetTime() end
+    if not clue or not destGUID or isSecretValue(clue) or isSecretValue(sourceGUID) or isSecretValue(destGUID) then
+		return countDrop("secret values blocked")
+	end
     playerGUID = playerGUID or UnitGUID("player")
-    if NameplateSCT.db.global.personalOnly and NameplateSCT.db.global.personal and playerGUID ~= destGUID then return end -- Cancel out any non player targetted abilities if you have personalSCT only enabled
-	if NameplateSCT.db.global.filterEnabled and destGUID then -- Filter out mobId's if needed
+    if NameplateSCT.db.profile.personalOnly and NameplateSCT.db.profile.personal and playerGUID ~= destGUID then
+		return countDrop("personal only") -- Cancel out any non player targetted abilities if you have personalSCT only enabled
+	end
+	if NameplateSCT.db.profile.filterEnabled and destGUID then -- Filter out mobId's if needed
 		local _, _, _, _, _, destUnitId = strsplit("-", destGUID)
 		destUnitId = tostring(destUnitId) or "1"
-		if (NameplateSCT.db.global.inverseNPCFilter and not npcFiltersTable[destUnitId]) -- Inverse filter
+		if (NameplateSCT.db.profile.inverseNPCFilter and not npcFiltersTable[destUnitId]) -- Inverse filter
 			or
-		(not NameplateSCT.db.global.inverseNPCFilter and npcFiltersTable[destUnitId]) -- Normal Filter
-		then return end
+		(not NameplateSCT.db.profile.inverseNPCFilter and npcFiltersTable[destUnitId]) -- Normal Filter
+		then return countDrop("npc filter") end
 	end
-	if playerGUID == sourceGUID or (NameplateSCT.db.global.personal and playerGUID == destGUID) then -- Player events
+	if playerGUID == sourceGUID or (NameplateSCT.db.profile.personal and playerGUID == destGUID) then -- Player events
 		local destUnit = guidToUnit[destGUID]
-		if (destUnit) or (destGUID == playerGUID and NameplateSCT.db.global.personal) then
+		if (destUnit) or (destGUID == playerGUID and NameplateSCT.db.profile.personal) then
 			if string.find(clue, "_MISSED") then
 				local spellName, missType, spellId, amount, school, critical
 
@@ -880,9 +1278,9 @@ function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, de
 				if spellId and spellId == 0 then
 					spellId = nil -- Don't pass spellId 0
 				end
-				if NameplateSCT.db.global.filterEnabled then
+				if NameplateSCT.db.profile.filterEnabled then
 					local spellInFilter = filtersTable[tostring(spellId)] or filtersTable[spellName] or filtersTable["missed"]
-					if (NameplateSCT.db.global.inverseSpellFilter and not spellInFilter) or (not NameplateSCT.db.global.inverseSpellFilter and spellInFilter) then
+					if (NameplateSCT.db.profile.inverseSpellFilter and not spellInFilter) or (not NameplateSCT.db.profile.inverseSpellFilter and spellInFilter) then
 						return
 					end
 				end
@@ -903,9 +1301,9 @@ function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, de
 				if spellId and spellId == 0 then
 					spellId = nil -- Don't pass spellId 0
 				end
-				if NameplateSCT.db.global.filterEnabled then
+				if NameplateSCT.db.profile.filterEnabled then
 					local spellInFilter = filtersTable[tostring(spellId)] or filtersTable[spellName]
-					if (NameplateSCT.db.global.inverseSpellFilter and not spellInFilter) or (not NameplateSCT.db.global.inverseSpellFilter and spellInFilter) then
+					if (NameplateSCT.db.profile.inverseSpellFilter and not spellInFilter) or (not NameplateSCT.db.profile.inverseSpellFilter and spellInFilter) then
 						return
 					end
 				end
@@ -914,7 +1312,7 @@ function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, de
 		end
 	elseif sourceFlags and (bit.band(sourceFlags, COMBATLOG_OBJECT_TYPE_GUARDIAN) > 0 or bit.band(sourceFlags, COMBATLOG_OBJECT_TYPE_PET) > 0) and bit.band(sourceFlags, COMBATLOG_OBJECT_AFFILIATION_MINE) > 0 then -- Pet/Guardian events
 		local destUnit = guidToUnit[destGUID]
-		if (destUnit) or (destGUID == playerGUID and NameplateSCT.db.global.personal) then
+		if (destUnit) or (destGUID == playerGUID and NameplateSCT.db.profile.personal) then
 			if string.find(clue, "_MISSED") then
 				local spellName, missType, spellId, amount, critical
 
@@ -926,9 +1324,9 @@ function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, de
 				if spellId and spellId == 0 then
 					spellId = nil -- Don't pass spellId 0
 				end
-				if NameplateSCT.db.global.filterEnabled then
+				if NameplateSCT.db.profile.filterEnabled then
 					local spellInFilter = filtersTable[tostring(spellId)] or filtersTable[spellName] or filtersTable["missed"]
-					if (NameplateSCT.db.global.inverseSpellFilter and not spellInFilter) or (not NameplateSCT.db.global.inverseSpellFilter and spellInFilter) then
+					if (NameplateSCT.db.profile.inverseSpellFilter and not spellInFilter) or (not NameplateSCT.db.profile.inverseSpellFilter and spellInFilter) then
 						return
 					end
 				end
@@ -947,9 +1345,9 @@ function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, de
 				if spellId and spellId == 0 then
 					spellId = nil -- Don't pass spellId 0
 				end
-				if NameplateSCT.db.global.filterEnabled then
+				if NameplateSCT.db.profile.filterEnabled then
 					local spellInFilter = filtersTable[tostring(spellId)] or filtersTable[spellName]
-					if (NameplateSCT.db.global.inverseSpellFilter and not spellInFilter) or (not NameplateSCT.db.global.inverseSpellFilter and spellInFilter) then
+					if (NameplateSCT.db.profile.inverseSpellFilter and not spellInFilter) or (not NameplateSCT.db.profile.inverseSpellFilter and spellInFilter) then
 						return
 					end
 				end
@@ -966,6 +1364,162 @@ function NameplateSCT:COMBAT_LOG_EVENT_UNFILTERED ()
 	end
 end
 
+----------------------------------------------------------------------------------
+-- RESTRICTED CLIENT PATH (Forever / Midnight): UNIT_COMBAT + secret values
+----------------------------------------------------------------------------------
+-- The combat log is not usable there, UnitGUID is secret for nameplates and UnitIsUnit
+-- is unreliable, so a hit is anchored by resolving the unit token to its nameplate
+-- frame instead of banking a GUID -> unit table. UNIT_COMBAT reports one hit once per
+-- alias of the same unit ("nameplate3", "target", ...): duplicates are collapsed on the
+-- resolved plate frame, and the (secret) amount is passed to the FontString untouched.
+
+local MISS_ACTIONS = {
+	ABSORB = true, BLOCK = true, DEFLECT = true, DODGE = true, EVADE = true,
+	IMMUNE = true, MISS = true, PARRY = true, REFLECT = true, RESIST = true,
+}
+
+local HIT_ACTIONS = {
+	WOUND = true, SPELL = true, DAMAGE = true, RANGE = true, SWING = true, PERIODIC = true,
+}
+
+local MODERN_DUPLICATE_WINDOW = 0.05
+local ATTRIBUTION_WINDOW = 1.2
+
+local modernLastHit = {}
+local attributedSpellID, attributedSpellTime
+
+function NameplateSCT:UNIT_SPELLCAST_SUCCEEDED(event, unit, castGUID, spellID)
+	if not spellID or isSecretValue(spellID) then return end
+	attributedSpellID, attributedSpellTime = spellID, GetTime()
+end
+
+local function recentAttributedSpell()
+	if not attributedSpellID or (GetTime() - attributedSpellTime) > ATTRIBUTION_WINDOW then
+		return nil
+	end
+	return attributedSpellID
+end
+
+function NameplateSCT:UNIT_COMBAT(event, unit, action, flagText, amount, schoolMask)
+	if event ~= "UNIT_COMBAT" then return end
+	local d = self.diagnostics
+	if d then d.events = d.events + 1; d.lastEvent = GetTime() end
+	if not unit or not action then return end
+	if isSecretValue(unit) or isSecretValue(action) then return end
+	if not self.db.profile.enabled then return countDrop("addon disabled") end
+	if action == "HEAL" or action == "ENERGIZE" then return countDrop("healing") end
+
+	local isMiss = MISS_ACTIONS[action] == true
+	if not isMiss and not HIT_ACTIONS[action] then return countDrop("unknown action") end
+	if isMiss and not self.db.profile.showMisses then return countDrop("misses off") end
+
+	-- Resolve the anchor first: nameplate mode needs a plate, screen mode does not.
+	local isPlayer = (unit == "player")
+	if isPlayer and not self.db.profile.personal then return countDrop("damage you take is off") end
+	local screenMode = self:IsScreenMode()
+	local plate
+	if not isPlayer and not screenMode then
+		plate = getNamePlateForUnit(unit)
+		if not plate then
+			return countDrop(isTargetOfTargetToken(unit) and "target-of-target has no plate" or "no nameplate for unit")
+		end
+	end
+
+	-- Collapse the per-alias repeat of a single hit.
+	local key = plate or (screenMode and ("screen-" .. tostring(unit)) or "player")
+	local now = GetTime()
+	local last = modernLastHit[key]
+	if last and last.action == action and (now - last.time) <= MODERN_DUPLICATE_WINDOW then
+		last.time = now
+		if d then d.duplicates = d.duplicates + 1 end
+		return
+	end
+	modernLastHit[key] = { action = action, time = now }
+
+	-- Target state is best effort: when UnitIsUnit cannot answer we show the text
+	-- anyway rather than hiding every number.
+	local onTarget, targetKnown = false, false
+	if not isPlayer then
+		onTarget, targetKnown = safeUnitIsUnit(unit, "target")
+	end
+
+	-- displayOffTargetText is honoured on both paths: an off-target unit known not to be
+	-- the target is dropped when the setting is off. An answer the client refused keeps the
+	-- number, because hiding everything would be worse than an extra number.
+	if not isPlayer and targetKnown and not onTarget and not self.db.profile.displayOffTargetText then
+		return countDrop("off-target text is off")
+	end
+
+	if isMiss then
+		local animation = isPlayer and self.db.profile.animationsPersonal.miss or self.db.profile.animations.miss
+		if animation == "disabled" then return countDrop("miss animation is disabled") end
+
+		local color
+		if isPlayer then
+			color = self.db.profile.useMissColorPersonal and self.db.profile.missColorPersonal
+		else
+			color = self.db.profile.useMissColor and self.db.profile.missColor
+		end
+		color = color or (isPlayer and defaults.profile.missColorPersonal or defaults.profile.missColor)
+
+		local size = self.db.profile.formatting.size
+		if (not isPlayer) and targetKnown and not onTarget and self.db.profile.useOffTargetAppearance then
+			size = self.db.profile.offTargetFormatting.size
+		end
+		if (not isPlayer) and self.db.profile.sizing.miss then
+			size = size * self.db.profile.sizing.missScale
+		end
+		if size < 5 then size = 5 end
+
+		if d then d.misses = d.misses + 1 end
+		local text = "|Cff" .. color .. (MISS_EVENT_STRINGS[action] or L["Missed"]) .. "|r"
+		self:DisplayText(nil, text, size, animation, recentAttributedSpell(), true, nil, unit)
+		return
+	end
+
+	-- A hit. Threshold filtering and every size modifier are numeric comparisons that a
+	-- secret amount cannot survive, so with a secret amount the raw value goes straight to
+	-- the FontString and the numeric modifiers are skipped.
+	local isSecretAmount = isSecretValue(amount)
+	if isSecretAmount and d then d.secret = d.secret + 1 end
+
+	if not isSecretAmount and type(amount) == "number" then
+		local floor = math.max(self.db.profile.sizing.hideSmallHitsThreshold or 0, self.db.profile.minDamage or 0)
+		if floor > amount then
+			return countDrop("under the damage threshold")
+		end
+	end
+
+	local animation = isPlayer and self.db.profile.animationsPersonal.normal or self.db.profile.animations.ability
+	if animation == "disabled" then return countDrop("animation is disabled") end
+
+	local size = self.db.profile.formatting.size
+	if (not isPlayer) and targetKnown and not onTarget and self.db.profile.useOffTargetAppearance then
+		size = self.db.profile.offTargetFormatting.size
+	end
+	if not size or size < 5 then size = 5 end
+
+	local text
+	if isSecretAmount then
+		text = amount
+	elseif type(amount) == "number" then
+		text = self:truncateText(amount)
+		if isPlayer then
+			text = "-" .. text
+			if self.db.profile.damageColorPersonal then
+				text = "|Cff" .. self.db.profile.defaultColorPersonal .. text .. "|r"
+			end
+		elseif self.db.profile.damageColor then
+			local color = (schoolMask and DAMAGE_TYPE_COLORS[schoolMask]) or self.db.profile.defaultColor
+			text = "|Cff" .. color .. text .. "|r"
+		end
+	else
+		text = tostring(amount)
+	end
+
+	self:DisplayText(nil, text, size, animation, recentAttributedSpell(), false, nil, unit)
+end
+
 -------------
 -- DISPLAY --
 -------------
@@ -973,6 +1527,9 @@ end
 local function commaSeperate(number)
 	-- https://stackoverflow.com/questions/10989788/lua-format-integer
 	local _, _, minus, int, fraction = tostring(number):find('([-]?)(%d+)([.]?%d*)')
+	if not int then
+		return tostring(number)
+	end
 	int = int:reverse():gsub("(%d%d%d)", "%1,")
 	return minus..int:reverse():gsub("^,", "")..fraction
 end
@@ -985,20 +1542,20 @@ function NameplateSCT:truncateText(amount)
 		return tostring(amount)
 	end
 	local text
-	if self.db.global.truncateMethod == 'NONE' then
-		if (self.db.global.commaSeperate) then
+	if self.db.profile.truncateMethod == 'NONE' then
+		if (self.db.profile.commaSeperate) then
 			text = commaSeperate(amount)
 		else
 			text = tostring(amount)
 		end
 
-	elseif self.db.global.truncateMethod == 'WESTERN' then
+	elseif self.db.profile.truncateMethod == 'WESTERN' then
 		local unitLetter = ''
-		if self.db.global.truncateLetter then
+		if self.db.profile.truncateLetter then
 			unitLetter = 'k'
 		end
 
-		if amount >= 1000000 and self.db.global.truncateLetter then
+		if amount >= 1000000 and self.db.profile.truncateLetter then
 			text = string.format("%.1fM", amount / 1000000)
 		elseif amount >= 10000 then
 			text = string.format("%.0f%s", amount / 1000, unitLetter)
@@ -1007,10 +1564,10 @@ function NameplateSCT:truncateText(amount)
 		else
 			text = tostring(amount)
 		end
-	elseif self.db.global.truncateMethod == 'EASTASIA' then
+	elseif self.db.profile.truncateMethod == 'EASTASIA' then
 
 		local unitLetter = ''
-		if self.db.global.truncateLetter then
+		if self.db.profile.truncateLetter then
 			unitLetter = L["Truncate Letter East Asia"]
 			if unitLetter == 'Truncate Letter East Asia' then
 				-- miss locale, Use its pronunciation instead
@@ -1039,6 +1596,9 @@ local lastDamageEventTime
 local runningAverageDamageEvents = 0
 function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, crit, spellId, absorbed)
 	local isSecretAmount = isSecretValue(amount)
+	if isSecretAmount and NameplateSCT.diagnostics then
+		NameplateSCT.diagnostics.secret = NameplateSCT.diagnostics.secret + 1
+	end
 	local isSecretAbsorbed = isSecretValue(absorbed)
 	local isSecretCrit = isSecretValue(crit)
 
@@ -1046,10 +1606,11 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
 	absorbed = absorbed or 0
 	local onPlayer = guid == playerGUID
 
-	-- Hide small hits based on threshold
+	-- Hide small hits: the relative threshold and the absolute minimum both apply
 	if not isSecretAmount and not isSecretAbsorbed then
-		if self.db.global.sizing.hideSmallHitsThreshold > (amount + absorbed) then
-			return
+		local floor = math.max(self.db.profile.sizing.hideSmallHitsThreshold or 0, self.db.profile.minDamage or 0)
+		if floor > (amount + absorbed) then
+			return countDrop("under the damage threshold")
 		end
 	end
 
@@ -1059,38 +1620,38 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
 
 	-- select an animation
 	if (autoattack and critFlag) then
-		animation = not onPlayer and self.db.global.animations.autoattackcrit or self.db.global.animationsPersonal.crit
+		animation = not onPlayer and self.db.profile.animations.autoattackcrit or self.db.profile.animationsPersonal.crit
 		pow = true
 	elseif (autoattack) then
-		animation = not onPlayer and self.db.global.animations.autoattack or self.db.global.animationsPersonal.normal
+		animation = not onPlayer and self.db.profile.animations.autoattack or self.db.profile.animationsPersonal.normal
 		pow = false
 	elseif (critFlag) then
-		animation = not onPlayer and self.db.global.animations.crit or self.db.global.animationsPersonal.crit
+		animation = not onPlayer and self.db.profile.animations.crit or self.db.profile.animationsPersonal.crit
 		pow = true
 	elseif (not autoattack and not critFlag) then
-		animation = not onPlayer and self.db.global.animations.ability or self.db.global.animationsPersonal.normal
+		animation = not onPlayer and self.db.profile.animations.ability or self.db.profile.animationsPersonal.normal
 		pow = false
 	end
 
 	-- skip if this damage event is disabled
 	if (animation == "disabled") then
-		return
+		return countDrop("animation is disabled")
 	end
 
 	local unit = guidToUnit[guid]
-	local isTarget = unit and UnitIsUnit(unit, "target")
+	local isTarget = safeUnitIsUnit(unit, "target")
 
-	if (not isTarget and not self.db.global.displayOffTargetText) then
-		return
+	if (not isTarget and not self.db.profile.displayOffTargetText) then
+		return countDrop("off-target text is off")
 	end
 
-	if (self.db.global.useOffTargetAppearance and not isTarget and not onPlayer) then
-		size = self.db.global.offTargetFormatting.size
+	if (self.db.profile.useOffTargetAppearance and not isTarget and not onPlayer) then
+		size = self.db.profile.offTargetFormatting.size
 	else
-		size = self.db.global.formatting.size
+		size = self.db.profile.formatting.size
 	end
 
-    if not NameplateSCT.db.global.showIconOnly then
+    if not NameplateSCT.db.profile.showIconOnly then
         if isSecretAmount then
             text = amount
         else
@@ -1102,7 +1663,7 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
                 text = ("-%s"):format(text)
             end
 
-            if NameplateSCT.db.global.showAbsorbDamage and not isSecretAbsorbed and absorbed > 0 then
+            if NameplateSCT.db.profile.showAbsorbDamage and not isSecretAbsorbed and absorbed > 0 then
                 local absorbedText = self:truncateText(absorbed)
                 text = L["%s (A: %s)"]:format(text, absorbedText)
             end
@@ -1112,7 +1673,7 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
     end
 
 	-- shrink small hits
-	if not isSecretAmount and (self.db.global.sizing.smallHits or self.db.global.sizing.smallHitsHide) and not onPlayer then
+	if not isSecretAmount and (self.db.profile.sizing.smallHits or self.db.profile.sizing.smallHitsHide) and not onPlayer then
 		if (not lastDamageEventTime or (lastDamageEventTime + SMALL_HIT_EXPIRY_WINDOW < GetTime())) then
 			numDamageEvents = 0
 			runningAverageDamageEvents = 0
@@ -1124,22 +1685,22 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
 
 		if ((not critFlag and amount < SMALL_HIT_MULTIPIER*runningAverageDamageEvents)
 			or (critFlag and amount/2 < SMALL_HIT_MULTIPIER*runningAverageDamageEvents)) then
-			if self.db.global.sizing.smallHitsHide then
+			if self.db.profile.sizing.smallHitsHide then
 				-- skip this damage event, it's too small
 				return
 			else
-				size = size * self.db.global.sizing.smallHitsScale
+				size = size * self.db.profile.sizing.smallHitsScale
 			end
 		end
 	end
 
 	-- embiggen crit's size
-	if (self.db.global.sizing.crits and critFlag) and not onPlayer then
-		if (autoattack and not self.db.global.sizing.autoattackcritsizing) then
+	if (self.db.profile.sizing.crits and critFlag) and not onPlayer then
+		if (autoattack and not self.db.profile.sizing.autoattackcritsizing) then
 			-- don't embiggen autoattacks
 			pow = false
 		else
-			size = size * self.db.global.sizing.critsScale
+			size = size * self.db.profile.sizing.critsScale
 		end
 	end
 
@@ -1148,9 +1709,9 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
 		size = 5
 	end
 
-    if NameplateSCT.db.global.showIconOnly then
+    if NameplateSCT.db.profile.showIconOnly then
         self:DisplayIconWithoutText(guid, size, animation, spellId, pow, spellName)
-    elseif (not isSecretAmount and type(overkill) == "number" and overkill > 0 and (self.db.global.shouldDisplayOverkill or onPlayer)) then
+    elseif (not isSecretAmount and type(overkill) == "number" and overkill > 0 and (self.db.profile.shouldDisplayOverkill or onPlayer)) then
         text = self:ColorText(L["%s (O: %s)"]:format(text, self:truncateText(overkill)), guid, playerGUID, school, spellName, crit)
         self:DisplayTextOverkill(guid, text, size, animation, spellId, pow, spellName)
     else
@@ -1159,30 +1720,32 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
 end
 
 function NameplateSCT:MissEvent(guid, spellName, missType, spellId)
+	if not self.db.profile.showMisses then return end
+
 	local text, animation, pow, size, color
 	local unit = guidToUnit[guid]
-	local isTarget = unit and UnitIsUnit(unit, "target")
+	local isTarget = safeUnitIsUnit(unit, "target")
 
 	if playerGUID ~= guid then
-		animation = self.db.global.animations.miss
-		color = self.db.global.useMissColor and self.db.global.missColor or defaults.global.missColor
+		animation = self.db.profile.animations.miss
+		color = self.db.profile.useMissColor and self.db.profile.missColor or defaults.profile.missColor
 	else
-		animation = self.db.global.animationsPersonal.miss
-		color = self.db.global.useMissColorPersonal and self.db.global.missColorPersonal or defaults.global.missColorPersonal
+		animation = self.db.profile.animationsPersonal.miss
+		color = self.db.profile.useMissColorPersonal and self.db.profile.missColorPersonal or defaults.profile.missColorPersonal
 	end
 
 	-- No animation set, cancel out
-	if (animation == "disabled") then return end
+	if (animation == "disabled") then return countDrop("miss animation is disabled") end
 
-	if (self.db.global.useOffTargetAppearance and not isTarget and playerGUID ~= guid) then
-		size = self.db.global.offTargetFormatting.size
+	if (self.db.profile.useOffTargetAppearance and not isTarget and playerGUID ~= guid) then
+		size = self.db.profile.offTargetFormatting.size
 	else
-		size = self.db.global.formatting.size
+		size = self.db.profile.formatting.size
 	end
 
 	-- embiggen miss size
-	if self.db.global.sizing.miss and playerGUID ~= guid then
-		size = size * self.db.global.sizing.missScale
+	if self.db.profile.sizing.miss and playerGUID ~= guid then
+		size = size * self.db.profile.sizing.missScale
 	end
 
 	pow = true
@@ -1197,102 +1760,133 @@ function NameplateSCT:MissEvent(guid, spellName, missType, spellId)
 	self:DisplayText(guid, text, size, animation, spellId, pow, spellName)
 end
 
-function NameplateSCT:DisplayText(guid, text, size, animation, spellId, pow, spellName)
+function NameplateSCT:DisplayText(guid, text, size, animation, spellId, pow, spellName, unitOverride)
 	local fontString
 	local icon
-	local unit = guidToUnit[guid]
-	local nameplate
-
-	if (unit) then
-		nameplate = C_NamePlate.GetNamePlateForUnit(unit)
+	local unit = unitOverride
+	if not unit and guid and not isSecretValue(guid) then
+		unit = guidToUnit[guid]
 	end
+	local nameplate
+	local screenMode = self:IsScreenMode()
 
-	-- if there isn't an anchor frame, make sure that there is a guidNameplatePosition cache entry
-	if guid and playerGUID == guid and not unit then
-		nameplate = "player"
-	elseif (not nameplate) then
-		return
+	if screenMode then
+		local incoming = (unit == "player")
+			or (guid and playerGUID and not isSecretValue(guid) and guid == playerGUID)
+		nameplate = self:GetScreenAnchor(incoming)
+	else
+		nameplate = getNamePlateForUnit(unit)
+
+		-- if there isn't an anchor frame, make sure that there is a guidNameplatePosition cache entry
+		if unit == "player" and not nameplate then
+			nameplate = "player"
+		elseif guid and playerGUID == guid and not unit then
+			nameplate = "player"
+		elseif (not nameplate) then
+			return countDrop("no anchor for this number")
+		end
 	end
 
 	fontString = getFontString()
+
+	local d = self.diagnostics
+	if d then
+		d.drawn = d.drawn + 1
+		d.lastDraw = GetTime()
+	end
 
 	fontString.NSCTText = text
 	fontString:SetText(fontString.NSCTText)
 
 	fontString.NSCTFontSize = size
-	fontString:SetFont(getFontPath(NameplateSCT.db.global.font), fontString.NSCTFontSize, NameplateSCT.db.global.fontFlag)
-	if NameplateSCT.db.global.textShadow then fontString:SetShadowOffset(1,-1) else fontString:SetShadowOffset(0, 0) end
-	fontString.startHeight = fontString:GetStringHeight()
-	fontString.pow = pow
-
-	if (not fontString.startHeight or type(fontString.startHeight) ~= "number" or fontString.startHeight <= 0) then
-		fontString.startHeight = 5
+	fontString:SetFont(getFontPath(NameplateSCT.db.profile.font), fontString.NSCTFontSize, NameplateSCT.db.profile.fontFlag)
+	applyShadow(fontString, size)
+	-- GetStringHeight is SecretWhenAnchoringSecret: once this FontString holds a secret
+	-- amount its height is secret too, and startHeight feeds arithmetic in powSizing. Keep
+	-- it plain by measuring only when the client allows the read.
+	local measured = fontString:GetStringHeight()
+	if canaccessvalue(measured) and type(measured) == "number" and measured > 0 then
+		fontString.startHeight = measured
+	else
+		fontString.startHeight = fontString.NSCTFontSize or 5
 	end
+	fontString.pow = pow
 
 	fontString.unit = unit
 	fontString.guid = guid
+	fontString.screenMode = screenMode
 
 	local texture = GetSpellTexture(spellId or spellName or "")
-	if NameplateSCT.db.global.showIcon and texture then
+	if NameplateSCT.db.profile.showIcon and texture then
 		icon = fontString.icon
 		icon:Show()
 		icon:SetTexture(texture)
-		if MSQ and NameplateSCT.db.global.enableMSQ then
-			icon.button:SetSize(size * NameplateSCT.db.global.iconScale, size * NameplateSCT.db.global.iconScale)
+		if MSQ and NameplateSCT.db.profile.enableMSQ then
+			icon.button:SetSize(size * NameplateSCT.db.profile.iconScale, size * NameplateSCT.db.profile.iconScale)
 			icon.button:SetPoint(
-				inversePositions[NameplateSCT.db.global.iconPosition],
+				inversePositions[NameplateSCT.db.profile.iconPosition],
 				fontString,
-				NameplateSCT.db.global.iconPosition,
-				NameplateSCT.db.global.xOffsetIcon,
-				NameplateSCT.db.global.yOffsetIcon
+				NameplateSCT.db.profile.iconPosition,
+				NameplateSCT.db.profile.xOffsetIcon,
+				NameplateSCT.db.profile.yOffsetIcon
 			)
 			icon.button:Show()
 		else
-			icon:SetSize(size*NameplateSCT.db.global.iconScale, size*NameplateSCT.db.global.iconScale)
+			icon:SetSize(size*NameplateSCT.db.profile.iconScale, size*NameplateSCT.db.profile.iconScale)
 			icon:SetPoint(
-				inversePositions[NameplateSCT.db.global.iconPosition],
+				inversePositions[NameplateSCT.db.profile.iconPosition],
 				fontString,
-				NameplateSCT.db.global.iconPosition,
-				NameplateSCT.db.global.xOffsetIcon,
-				NameplateSCT.db.global.yOffsetIcon
+				NameplateSCT.db.profile.iconPosition,
+				NameplateSCT.db.profile.xOffsetIcon,
+				NameplateSCT.db.profile.yOffsetIcon
 			)
 		end
         fontString.icon = icon
     else
 		if fontString.icon then
 			fontString.icon:Hide()
-			if MSQ and NameplateSCT.db.global.enableMSQ then
+			if MSQ and NameplateSCT.db.profile.enableMSQ then
 				fontString.icon.button:Hide()
 			end
 		end
 	end
-	local duration = NameplateSCT.db.global.animations.animationspeed
+	local duration = NameplateSCT.db.profile.animations.animationspeed
 	if animation == "fireworks" then
-		duration = NameplateSCT.db.global.animations.fireworksDuration
+		duration = NameplateSCT.db.profile.animations.fireworksDuration
 	end
 	self:Animate(fontString, nameplate, duration, animation)
 end
 
-function NameplateSCT:DisplayIconWithoutText(guid, size, animation, spellId, pow, spellName)
+function NameplateSCT:DisplayIconWithoutText(guid, size, animation, spellId, pow, spellName, unitOverride)
 	local fontString
 	local icon
-	local unit = guidToUnit[guid]
-	local nameplate
-
-	if (unit) then
-		nameplate = C_NamePlate.GetNamePlateForUnit(unit)
+	local unit = unitOverride
+	if not unit and guid and not isSecretValue(guid) then
+		unit = guidToUnit[guid]
 	end
+	local nameplate
+	local screenMode = self:IsScreenMode()
 
-	-- if there isn't an anchor frame, make sure that there is a guidNameplatePosition cache entry
-	if guid and playerGUID == guid and not unit then
-		nameplate = "player"
-	elseif (not nameplate) then
-		return
+	if screenMode then
+		local incoming = (unit == "player")
+			or (guid and playerGUID and not isSecretValue(guid) and guid == playerGUID)
+		nameplate = self:GetScreenAnchor(incoming)
+	else
+		nameplate = getNamePlateForUnit(unit)
+
+		if unit == "player" and not nameplate then
+			nameplate = "player"
+		elseif guid and playerGUID == guid and not unit then
+			nameplate = "player"
+		elseif (not nameplate) then
+			return countDrop("no anchor for this number")
+		end
 	end
 
 	fontString = getFontString()
 	fontString.NSCTText = ""
 	fontString:SetText(fontString.NSCTText)
+	applyShadow(fontString)
 	fontString.NSCTFontSize = size
 	fontString.startHeight = fontString.NSCTFontSize
 	fontString.pow = pow
@@ -1303,44 +1897,45 @@ function NameplateSCT:DisplayIconWithoutText(guid, size, animation, spellId, pow
 
 	fontString.unit = unit
 	fontString.guid = guid
+	fontString.screenMode = screenMode
 
 	local texture = GetSpellTexture(spellId or spellName or "")
-	if NameplateSCT.db.global.showIcon and texture then
+	if NameplateSCT.db.profile.showIcon and texture then
 		icon = fontString.icon
 		icon:Show()
 		icon:SetTexture(texture)
-		if MSQ and NameplateSCT.db.global.enableMSQ then
-			icon.button:SetSize(size * NameplateSCT.db.global.iconScale, size * NameplateSCT.db.global.iconScale)
+		if MSQ and NameplateSCT.db.profile.enableMSQ then
+			icon.button:SetSize(size * NameplateSCT.db.profile.iconScale, size * NameplateSCT.db.profile.iconScale)
 			icon.button:SetPoint(
-				inversePositions[NameplateSCT.db.global.iconPosition],
+				inversePositions[NameplateSCT.db.profile.iconPosition],
 				fontString,
-				NameplateSCT.db.global.iconPosition,
-				NameplateSCT.db.global.xOffsetIcon,
-				NameplateSCT.db.global.yOffsetIcon
+				NameplateSCT.db.profile.iconPosition,
+				NameplateSCT.db.profile.xOffsetIcon,
+				NameplateSCT.db.profile.yOffsetIcon
 			)
 			icon.button:Show()
 		else
-			icon:SetSize(size*NameplateSCT.db.global.iconScale, size*NameplateSCT.db.global.iconScale)
+			icon:SetSize(size*NameplateSCT.db.profile.iconScale, size*NameplateSCT.db.profile.iconScale)
 			icon:SetPoint(
-				inversePositions[NameplateSCT.db.global.iconPosition],
+				inversePositions[NameplateSCT.db.profile.iconPosition],
 				fontString,
-				NameplateSCT.db.global.iconPosition,
-				NameplateSCT.db.global.xOffsetIcon,
-				NameplateSCT.db.global.yOffsetIcon
+				NameplateSCT.db.profile.iconPosition,
+				NameplateSCT.db.profile.xOffsetIcon,
+				NameplateSCT.db.profile.yOffsetIcon
 			)
 		end
         fontString.icon = icon
     else
 		if fontString.icon then
 			fontString.icon:Hide()
-			if MSQ and NameplateSCT.db.global.enableMSQ then
+			if MSQ and NameplateSCT.db.profile.enableMSQ then
 				fontString.icon.button:Hide()
 			end
 		end
 	end
-	local duration = NameplateSCT.db.global.animations.animationspeed
+	local duration = NameplateSCT.db.profile.animations.animationspeed
 	if animation == "fireworks" then
-		duration = NameplateSCT.db.global.animations.fireworksDuration
+		duration = NameplateSCT.db.profile.animations.fireworksDuration
 	end
 	self:Animate(fontString, nameplate, duration, animation)
 end
@@ -1356,54 +1951,58 @@ function NameplateSCT:DisplayTextOverkill(guid, text, size, animation, spellId, 
 	fontString:SetText(fontString.NSCTText)
 
 	fontString.NSCTFontSize = size
-	fontString:SetFont(getFontPath(NameplateSCT.db.global.font), fontString.NSCTFontSize, NameplateSCT.db.global.fontFlag)
-	if NameplateSCT.db.global.textShadow then fontString:SetShadowOffset(1,-1) else fontString:SetShadowOffset(0, 0) end
-	fontString.startHeight = fontString:GetStringHeight()
-	fontString.pow = pow
-
-	if (not fontString.startHeight or type(fontString.startHeight) ~= "number" or fontString.startHeight <= 0) then
-		fontString.startHeight = 5
+	fontString:SetFont(getFontPath(NameplateSCT.db.profile.font), fontString.NSCTFontSize, NameplateSCT.db.profile.fontFlag)
+	applyShadow(fontString, size)
+	-- GetStringHeight is SecretWhenAnchoringSecret: once this FontString holds a secret
+	-- amount its height is secret too, and startHeight feeds arithmetic in powSizing. Keep
+	-- it plain by measuring only when the client allows the read.
+	local measured = fontString:GetStringHeight()
+	if canaccessvalue(measured) and type(measured) == "number" and measured > 0 then
+		fontString.startHeight = measured
+	else
+		fontString.startHeight = fontString.NSCTFontSize or 5
 	end
+	fontString.pow = pow
 
 	fontString.unit = "player"
 	fontString.guid = guid
 	local texture = GetSpellTexture(spellId or spellName or "")
-	if NameplateSCT.db.global.showIcon and texture then
+	if NameplateSCT.db.profile.showIcon and texture then
 	icon = fontString.icon
 	icon:Show()
 	icon:SetTexture(texture)
-	if MSQ and NameplateSCT.db.global.enableMSQ then
-		icon.button:SetSize(size*NameplateSCT.db.global.iconScale, size*NameplateSCT.db.global.iconScale)
+	if MSQ and NameplateSCT.db.profile.enableMSQ then
+		icon.button:SetSize(size*NameplateSCT.db.profile.iconScale, size*NameplateSCT.db.profile.iconScale)
 		icon.button:SetPoint(
-		inversePositions[NameplateSCT.db.global.iconPosition],
+		inversePositions[NameplateSCT.db.profile.iconPosition],
 		fontString,
-		NameplateSCT.db.global.iconPosition,
-		NameplateSCT.db.global.xOffsetIcon,
-		NameplateSCT.db.global.yOffsetIcon
+		NameplateSCT.db.profile.iconPosition,
+		NameplateSCT.db.profile.xOffsetIcon,
+		NameplateSCT.db.profile.yOffsetIcon
 		)
 		icon.button:Show()
 	else
-		icon:SetSize(size*NameplateSCT.db.global.iconScale, size*NameplateSCT.db.global.iconScale)
+		icon:SetSize(size*NameplateSCT.db.profile.iconScale, size*NameplateSCT.db.profile.iconScale)
 		icon:SetPoint(
-		inversePositions[NameplateSCT.db.global.iconPosition],
+		inversePositions[NameplateSCT.db.profile.iconPosition],
 		fontString,
-		NameplateSCT.db.global.iconPosition,
-		NameplateSCT.db.global.xOffsetIcon,
-		NameplateSCT.db.global.yOffsetIcon
+		NameplateSCT.db.profile.iconPosition,
+		NameplateSCT.db.profile.xOffsetIcon,
+		NameplateSCT.db.profile.yOffsetIcon
 		)
 	end
 	fontString.icon = icon
 	else
 	if fontString.icon then
 		fontString.icon:Hide()
-		if MSQ and NameplateSCT.db.global.enableMSQ then
+		if MSQ and NameplateSCT.db.profile.enableMSQ then
 		fontString.icon.button:Hide()
 		end
 	end
 	end
-	local duration = NameplateSCT.db.global.animations.animationspeed
+	local duration = NameplateSCT.db.profile.animations.animationspeed
 	if animation == "fireworks" then
-		duration = NameplateSCT.db.global.animations.fireworksDuration
+		duration = NameplateSCT.db.profile.animations.fireworksDuration
 	end
 	self:Animate(fontString, nameplate, duration, animation)
 end
@@ -1414,22 +2013,22 @@ function NameplateSCT:ColorText(startingText, guid, pGUID, school, spellName, cr
 	end
 	local finalText
 	if guid ~= (pGUID or playerGUID) then
-		if crit and self.db.global.useCritColor then
-			finalText = "|Cff"..self.db.global.critColor..startingText.."|r"
-		elseif self.db.global.damageColor and school and DAMAGE_TYPE_COLORS[school] then
+		if crit and self.db.profile.useCritColor then
+			finalText = "|Cff"..self.db.profile.critColor..startingText.."|r"
+		elseif self.db.profile.damageColor and school and DAMAGE_TYPE_COLORS[school] then
 			finalText = "|Cff"..DAMAGE_TYPE_COLORS[school]..startingText.."|r"
-		elseif self.db.global.damageColor and spellName == "melee" and DAMAGE_TYPE_COLORS[spellName] then
+		elseif self.db.profile.damageColor and spellName == "melee" and DAMAGE_TYPE_COLORS[spellName] then
 			finalText = "|Cff"..DAMAGE_TYPE_COLORS[spellName]..startingText.."|r"
 		else
-			finalText = "|Cff"..self.db.global.defaultColor..startingText.."|r"
+			finalText = "|Cff"..self.db.profile.defaultColor..startingText.."|r"
 		end
 	else
-		if self.db.global.damageColorPersonal and school and DAMAGE_TYPE_COLORS[school] then
+		if self.db.profile.damageColorPersonal and school and DAMAGE_TYPE_COLORS[school] then
 			finalText = "|Cff"..DAMAGE_TYPE_COLORS[school]..startingText.."|r"
-		elseif self.db.global.damageColorPersonal and spellName == "melee" and DAMAGE_TYPE_COLORS[spellName] then
+		elseif self.db.profile.damageColorPersonal and spellName == "melee" and DAMAGE_TYPE_COLORS[spellName] then
 			finalText = "|Cff"..DAMAGE_TYPE_COLORS[spellName]..startingText.."|r"
 		else
-			finalText = "|Cff"..self.db.global.defaultColorPersonal..startingText.."|r"
+			finalText = "|Cff"..self.db.profile.defaultColorPersonal..startingText.."|r"
 		end
 	end
 
@@ -1440,6 +2039,11 @@ end
 -- OPTIONS --
 -------------
 
+-- The Blizzard AddOns panel is a launcher, not a settings tree.
+-- It used to mirror every saved setting in one very tall AceConfig page. That page cannot
+-- scroll inside the client's options canvas, so the section ran off the bottom of the
+-- window and nothing in it was reachable. The dashboard owns the settings now, so this
+-- panel only says where they live and carries the one button that opens it.
 local menu = {
 	name = "NameplateSCT",
 	handler = NameplateSCT,
@@ -1452,801 +2056,19 @@ local menu = {
 			order = 1,
 			width = "full",
 		},
-		-- enemyNameplatesEnabler = {
-		--	 type = 'toggle',
-		--	 name = "Enemy Nameplates - Enabling Required",
-		--	 get = function(_, newValue) return GetCVar("nameplateShowEnemies") == "1" end,
-		--	 set = function(_, newValue)
-		--		 if (newValue) then
-		--			 SetCVar("nameplateShowEnemies", 1)
-		--		 end
-		--	 end,
-		--	 hidden = function() return GetCVar("nameplateShowEnemies") == "1" end,
-		--	 order = 2,
-		--	 width = "full",
-		-- },
-		nameplatesEnabled2 = {
+		openDashboard = {
+			type = 'execute',
+			name = "Open NameplateSCT dashboard",
+			desc = "Opens the settings window. /nsct opens the same window.",
+			func = function() NameplateSCT:OpenMenu() end,
+			order = 2,
+			width = "full",
+		},
+		whereSettingsLive = {
 			type = 'description',
-			name = "|cFFFF0000"..L["YOUR ENEMY NAMEPLATES ARE DISABLED, NAMEPLATESCT WILL NOT WORK!!"].."|r",
-			hidden = function() return GetCVar("nameplateShowEnemies") == "1" end,
+			name = "Every setting, the profiles and the live combat-source counters are in that window.",
 			order = 3,
 			width = "full",
-		},
-		enable = {
-			type = 'toggle',
-			name = L["Enable"],
-			desc = L["If the addon is enabled."],
-			get = "IsEnabled",
-			set = function(_, newValue) if (not newValue) then NameplateSCT:Disable() else NameplateSCT:Enable() end end,
-			order = 4,
-			width = "full",
-		},
-
-		disableBlizzardFCT = {
-			type = 'toggle',
-			name = L["BlizzardSCT"],
-			get = function(_, newValue) return GetCVar(blizzardCvar) == "1" end,
-			set = function(_, newValue)
-				if (newValue) then
-					SetCVar(blizzardCvar, 1)
-				else
-					SetCVar(blizzardCvar, 0)
-				end
-			end,
-			order = 5,
-			width = "full",
-		},
-
-		displayOverkill = {
-			type = 'toggle',
-			name = L["Display Overkill"],
-			desc = L["Display your overkill for a target over your own nameplate"],
-			get = function() return NameplateSCT.db.global.shouldDisplayOverkill end,
-			set = function(_, newValue) NameplateSCT.db.global.shouldDisplayOverkill = newValue end,
-			order = 6,
-		},
-
-		showAbsorbs = {
-			type = 'toggle',
-			name = L["Show Absorbed Damage"],
-			desc = L["Show Absorbed Damage shown as: '5 (A: 3)' where A: 3 is the absorbed amount"],
-			get = function() return NameplateSCT.db.global.showAbsorbDamage end,
-			set = function(_, newValue) NameplateSCT.db.global.showAbsorbDamage = newValue end,
-			order = 6.3,
-		},
-
-		divider = {
-			type = 'description',
-			name = "",
-			order = 6.6,
-			width = "full",
-		},
-
-		personalNameplate = {
-			type = 'toggle',
-			name = L["Personal SCT"],
-			desc = L["Also show numbers when you take damage on your personal nameplate or center screen"],
-			get = function() return NameplateSCT.db.global.personal end,
-			set = function(_, newValue) NameplateSCT.db.global.personal = newValue end,
-			order = 7,
-			disabled = function() return not NameplateSCT.db.global.enabled end
-		},
-
-		personalNameplateOnly = {
-			type = 'toggle',
-			name = L["Personal SCT Only"],
-			desc = L["Don't display any numbers on enemies and only use the personal SCT."],
-				get = function() return NameplateSCT.db.global.personalOnly end,
-				set = function(_, newValue) NameplateSCT.db.global.personalOnly = newValue end,
-			order = 8,
-			disabled = function() return (not NameplateSCT.db.global.personal or not NameplateSCT.db.global.enabled) end
-		},
-		animations = {
-			type = 'group',
-			name = L["Animations"],
-			order = 30,
-			inline = true,
-			disabled = function() return not NameplateSCT.db.global.enabled end,
-			args = {
-				speed = {
-					type = 'range',
-					name = L["Animation Speed"],
-					desc = L["Default speed: 1"],
-					disabled = function() return not NameplateSCT.db.global.enabled end,
-					min = 0.5,
-					max = 2,
-					step = .1,
-					get = function() return NameplateSCT.db.global.animations.animationspeed end,
-					set = function(_, newValue) NameplateSCT.db.global.animations.animationspeed = newValue end,
-					order = 1,
-					width = "full",
-				},
-				fireworksSettings = {
-					type = 'header',
-					name = L["Fireworks Settings"],
-					order = 1.2,
-				},
-				fireworksRadius = {
-					type = 'range',
-					name = L["Fireworks Radius"],
-					desc = L["Start radius for fireworks animation"],
-					disabled = function() return not NameplateSCT.db.global.enabled end,
-					min = 0,
-					max = 200,
-					step = 20,
-					get = function() return NameplateSCT.db.global.animations.fireworksRadius end,
-					set = function(_, newValue) NameplateSCT.db.global.animations.fireworksRadius = newValue end,
-					order = 1.3,
-					width = "normal",
-				},
-				fireworksDuration = {
-					type = 'range',
-					name = L["Fireworks Duration"],
-					desc = L["Duration of the fireworks animation"],
-					disabled = function() return not NameplateSCT.db.global.enabled end,
-					min = 0.5,
-					max = 3,
-					step = 0.5,
-					get = function() return NameplateSCT.db.global.animations.fireworksDuration end,
-					set = function(_, newValue) NameplateSCT.db.global.animations.fireworksDuration = newValue end,
-					order = 1.4,
-					width = "normal",
-				},
-				fireworksSpacer = {
-					type = 'description',
-					name = "",
-					order = 1.5,
-					width = "full",
-				},
-				ability = {
-					type = 'select',
-					name = L["Abilities"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.animations.ability end,
-					set = function(_, newValue) NameplateSCT.db.global.animations.ability = newValue end,
-					values = animationValues,
-					order = 2,
-				},
-				crit = {
-					type = 'select',
-					name = L["Criticals"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.animations.crit end,
-					set = function(_, newValue) NameplateSCT.db.global.animations.crit = newValue end,
-					values = animationValues,
-					order = 3,
-				},
-				miss = {
-					type = 'select',
-					name = L["Miss/Parry/Dodge/etc"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.animations.miss end,
-					set = function(_, newValue) NameplateSCT.db.global.animations.miss = newValue end,
-					values = animationValues,
-					order = 4,
-				},
-				autoattack = {
-					type = 'select',
-					name = L["Auto Attacks"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.animations.autoattack end,
-					set = function(_, newValue) NameplateSCT.db.global.animations.autoattack = newValue end,
-					values = animationValues,
-					order = 5,
-				},
-				autoattackcrit = {
-					type = 'select',
-					name = L["Criticals"],
-					desc = L["Auto attacks that are critical hits"],
-					get = function() return NameplateSCT.db.global.animations.autoattackcrit end,
-					set = function(_, newValue) NameplateSCT.db.global.animations.autoattackcrit = newValue end,
-					values = animationValues,
-					order = 6,
-				},
-				autoattackcritsizing = {
-					type = 'toggle',
-					name = L["Embiggen Crits"],
-					desc = L["Embiggen critical auto attacks"],
-					get = function() return NameplateSCT.db.global.sizing.autoattackcritsizing end,
-					set = function(_, newValue) NameplateSCT.db.global.sizing.autoattackcritsizing = newValue end,
-					order = 7,
-				},
-			},
-		},
-		appearance = {
-			type = 'group',
-			name = L["Appearance/Offsets"],
-			order = 50,
-			inline = true,
-			disabled = function() return not NameplateSCT.db.global.enabled end,
-			args = {
-				font = {
-					type = "select",
-					dialogControl = "LSM30_Font",
-					name = L["Font"],
-					order = 1,
-					values = AceGUIWidgetLSMlists.font,
-					get = function() return NameplateSCT.db.global.font end,
-					set = function(_, newValue) NameplateSCT.db.global.font = newValue end,
-				},
-				fontFlag = {
-					type = 'select',
-					name = L["Font Flags"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.fontFlag end,
-					set = function(_, newValue) NameplateSCT.db.global.fontFlag = newValue end,
-					values = fontFlags,
-					order = 2,
-				},
-				fontShadow = {
-					type = 'toggle',
-					name = L["Text Shadow"],
-					get = function() return NameplateSCT.db.global.textShadow end,
-					set = function(_, newValue) NameplateSCT.db.global.textShadow = newValue end,
-					order = 3,
-				},
-				damageColor = {
-					type = 'toggle',
-					name = L["Use Damage Type Color"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.damageColor end,
-					set = function(_, newValue) NameplateSCT.db.global.damageColor = newValue end,
-					order = 4,
-				},
-				defaultColor = {
-					type = 'color',
-					name = L["Default Color"],
-					desc = "",
-					disabled = function() return NameplateSCT.db.global.damageColor end,
-					hasAlpha = false,
-					set = function(_, r, g, b) NameplateSCT.db.global.defaultColor = rgbToHex(r, g, b) end,
-					get = function() return hexToRGB(NameplateSCT.db.global.defaultColor) end,
-					order = 5,
-				},
-				critColorNewLine = {
-					type = 'description',
-					name = "",
-					desc = "",
-					order = 6,
-				},
-				useCritColor = {
-					type = 'toggle',
-					name = L["Use Crit Color"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.useCritColor end,
-					set = function(_, newValue) NameplateSCT.db.global.useCritColor = newValue end,
-					order = 7,
-				},
-				critColor = {
-					type = 'color',
-					name = L["Crit Color"],
-					desc = "",
-					disabled = function() return not NameplateSCT.db.global.useCritColor end,
-					hasAlpha = false,
-					set = function(_, r, g, b) NameplateSCT.db.global.critColor = rgbToHex(r, g, b) end,
-					get = function() return hexToRGB(NameplateSCT.db.global.critColor) end,
-					order = 8,
-				},
-				missColorNewLine = {
-					type = 'description',
-					name = "",
-					desc = "",
-					order = 9,
-				},
-				useMissColor = {
-					type = 'toggle',
-					name = L["Custom Miss Color"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.useMissColor end,
-					set = function(_, newValue) NameplateSCT.db.global.useMissColor = newValue end,
-					order = 10,
-				},
-				missColor = {
-					type = 'color',
-					name = L["Miss Color"],
-					desc = "",
-					disabled = function() return not NameplateSCT.db.global.useMissColor end,
-					hasAlpha = false,
-					set = function(_, r, g, b) NameplateSCT.db.global.missColor = rgbToHex(r, g, b) end,
-					get = function() return hexToRGB(NameplateSCT.db.global.missColor) end,
-					order = 11,
-				},
-				offsetNewLine = {
-					type = 'description',
-					name = "",
-					desc = "",
-					order = 12,
-				},
-				targetStrata = {
-					type = 'select',
-					name = L["Target Strata"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.strata.target end,
-					set = function(_, newValue)
-						NameplateSCT.db.global.strata.target = newValue
-						adjustStrata()
-					end,
-					values = stratas,
-					order = 20,
-				},
-				modOffTargetStrata = {
-					type = 'toggle',
-					name = L["Use Separate Off-Target Strata"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.modOffTargetStrata end,
-					set = function(_, newValue) NameplateSCT.db.global.modOffTargetStrata = newValue end,
-					order = 21,
-				},
-				offTargetStrata = {
-					type = 'select',
-					name = L["Off-Target Strata"],
-					desc = "",
-					disabled = function() return not NameplateSCT.db.global.modOffTargetStrata end,
-					get = function() return NameplateSCT.db.global.strata.offTarget end,
-					set = function(_, newValue) NameplateSCT.db.global.strata.offTarget = newValue end,
-					values = stratas,
-					order = 22,
-				},
-				xOffset = {
-					type = 'range',
-					name = L["X Offset"],
-					desc = L["Has soft max/min, you can type whatever you'd like into the editbox"],
-					softMin = -75,
-					softMax = 75,
-					step = 1,
-					get = function() return NameplateSCT.db.global.xOffset end,
-					set = function(_, newValue) NameplateSCT.db.global.xOffset = newValue end,
-					order = 23,
-					width = 1.5,
-				},
-				yOffset = {
-					type = 'range',
-					name = L["Y Offset"],
-					desc = L["Has soft max/min, you can type whatever you'd like into the editbox"],
-					softMin = -75,
-					softMax = 75,
-					step = 1,
-					get = function() return NameplateSCT.db.global.yOffset end,
-					set = function(_, newValue) NameplateSCT.db.global.yOffset = newValue end,
-					order = 24,
-					width = 1.5,
-				},
-				xVariance = {
-					type = 'range',
-					name = L["X Variance"],
-					desc = L["Randomly varies the starting horizontal position of each damage number."],
-					min = 0,
-					softMax = 50,
-					step = 1,
-					get = function() return NameplateSCT.db.global.xVariance end,
-					set = function(_, newValue) NameplateSCT.db.global.xVariance = newValue end,
-					order = 25,
-					width = 1.5,
-				},
-				yVariance = {
-					type = 'range',
-					name = L["Y Variance"],
-					desc = L["Randomly varies the starting vertical position of each damage number."],
-					min = 0,
-					softMax = 50,
-					step = 1,
-					get = function() return NameplateSCT.db.global.yVariance end,
-					set = function(_, newValue) NameplateSCT.db.global.yVariance = newValue end,
-					order = 26,
-					width = 1.5,
-				},
-				iconAppearance = {
-					type = 'group',
-					name = L["Icons"],
-					order = 60,
-					inline = true,
-					disabled = function() return not NameplateSCT.db.global.enabled end,
-					args = {
-						showIcon = {
-							type = 'toggle',
-							name = L["Display Icon"],
-							desc = "",
-							get = function() return NameplateSCT.db.global.showIcon end,
-							set = function(_, newValue) NameplateSCT.db.global.showIcon = newValue end,
-							order = 1,
-							width = "Half"
-						},
-						iconOnly = {
-							type = 'toggle',
-							name = L["Display Icon Only"],
-							desc = L["Display only the icon for damage.\nWill not change Miss, Dodge, Parry, etc displays"],
-							get = function() return NameplateSCT.db.global.showIconOnly end,
-							set = function(_, newValue) NameplateSCT.db.global.showIconOnly = newValue end,
-							order = 2,
-							width = "Half"
-						},
-						removeBorders = {
-							type = 'toggle',
-							name = L["Remove Icon borders"],
-							desc = L["Zoom a bit into the icon to remove default blizzard border"],
-							get = function() return NameplateSCT.db.global.removeBorder end,
-							set = function(_, newValue) NameplateSCT.db.global.removeBorder = newValue end,
-							order = 3,
-							width = "Half"
-						},
-						enableMSQ = {
-							type = 'toggle',
-							name = L["Enable Masque"],
-							desc = L["Let Masuqe skin the icons"],
-							hidden = function() return not NameplateSCT.db.global.showIcon end,
-							get = function() return NameplateSCT.db.global.enableMSQ end,
-							set = function(_, newValue) NameplateSCT.db.global.enableMSQ = newValue end,
-							order = 4,
-							width = "Half"
-						},
-						iconScale = {
-							type = 'range',
-							name = L["Icon Scale"],
-							desc = L["Scale of the spell icon"],
-							softMin = 0.5,
-							softMax = 2,
-							isPercent = true,
-							step = 0.01,
-							hidden = function() return not NameplateSCT.db.global.showIcon end,
-							get = function() return NameplateSCT.db.global.iconScale end,
-							set = function(_, newValue) NameplateSCT.db.global.iconScale = newValue end,
-							order = 5,
-							width = "Half"
-						},
-						iconPosition = {
-							type = 'select',
-							name = L["Position"],
-							desc = "",
-							hidden = function() return not NameplateSCT.db.global.showIcon end,
-							get = function() return NameplateSCT.db.global.iconPosition or "Right" end,
-							set = function(_, newValue) NameplateSCT.db.global.iconPosition = newValue end,
-							values = positionValues,
-							order = 6,
-						},
-						xOffsetIcon = {
-							type = 'range',
-							name = L["Icon X Offset"],
-							hidden = function() return not NameplateSCT.db.global.showIcon end,
-							softMin = -30,
-							softMax = 30,
-							step = 1,
-							get = function() return NameplateSCT.db.global.xOffsetIcon or 0 end,
-							set = function(_, newValue) NameplateSCT.db.global.xOffsetIcon = newValue end,
-							order = 7,
-							width = "Half",
-						},
-						yOffsetIcon = {
-							type = 'range',
-							name = L["Icon Y Offset"],
-							hidden = function() return not NameplateSCT.db.global.showIcon end,
-							softMin = -30,
-							softMax = 30,
-							step = 1,
-							get = function() return NameplateSCT.db.global.yOffsetIcon or 0 end,
-							set = function(_, newValue) NameplateSCT.db.global.yOffsetIcon = newValue end,
-							order = 8,
-							width = "Half",
-						},
-					},
-				},
-			},
-		},
-
-		animationsPersonal = {
-			type = 'group',
-			name = L["Personal SCT Animations"],
-			order = 60,
-			inline = true,
-			disabled = function() return not NameplateSCT.db.global.personal end,
-			args = {
-				normalPersonal = {
-					type = 'select',
-					name = L["Default"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.animationsPersonal.normal end,
-					set = function(_, newValue) NameplateSCT.db.global.animationsPersonal.normal = newValue end,
-					values = animationValues,
-					order = 5,
-				},
-				critPersonal = {
-					type = 'select',
-					name = L["Criticals"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.animationsPersonal.crit end,
-					set = function(_, newValue) NameplateSCT.db.global.animationsPersonal.crit = newValue end,
-					values = animationValues,
-					order = 10,
-				},
-				missPersonal = {
-					type = 'select',
-					name = L["Miss/Parry/Dodge/etc"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.animationsPersonal.miss end,
-					set = function(_, newValue) NameplateSCT.db.global.animationsPersonal.miss = newValue end,
-					values = animationValues,
-					order = 15,
-				},
-				damageColorPersonal = {
-					type = 'toggle',
-					name = L["Use Damage Type Color"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.damageColorPersonal end,
-					set = function(_, newValue) NameplateSCT.db.global.damageColorPersonal = newValue end,
-					order = 40,
-				},
-				defaultColorPersonal = {
-					type = 'color',
-					name = L["Default Color"],
-					desc = "",
-					disabled = function() return NameplateSCT.db.global.damageColorPersonal end,
-					hasAlpha = false,
-					set = function(_, r, g, b) NameplateSCT.db.global.defaultColorPersonal = rgbToHex(r, g, b) end,
-					get = function() return hexToRGB(NameplateSCT.db.global.defaultColorPersonal) end,
-					order = 45,
-				},
-				personalMissColorNewLine = {
-					type = 'description',
-					name = "",
-					desc = "",
-					order = 49,
-				},
-				useMissColorPersonal = {
-					type = 'toggle',
-					name = L["Custom Miss Color"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.useMissColorPersonal end,
-					set = function(_, newValue) NameplateSCT.db.global.useMissColorPersonal = newValue end,
-					order = 50,
-				},
-				missColorPersonal = {
-					type = 'color',
-					name = L["Miss Color"],
-					desc = "",
-					disabled = function() return not NameplateSCT.db.global.useMissColorPersonal end,
-					hasAlpha = false,
-					set = function(_, r, g, b) NameplateSCT.db.global.missColorPersonal = rgbToHex(r, g, b) end,
-					get = function() return hexToRGB(NameplateSCT.db.global.missColorPersonal) end,
-					order = 55,
-				},
-				xOffsetPersonal = {
-					type = 'range',
-					name = L["X Offset Personal SCT"],
-					desc = L["Only used if Personal Nameplate is Disabled"],
-					softMin = -400,
-					softMax = 400,
-					step = 1,
-					get = function() return NameplateSCT.db.global.xOffsetPersonal end,
-					set = function(_, newValue) NameplateSCT.db.global.xOffsetPersonal = newValue end,
-					order = 80,
-					width = "full",
-				},
-				yOffsetPersonal = {
-					type = 'range',
-					name = L["Y Offset Personal SCT"],
-					desc = L["Only used if Personal Nameplate is Disabled"],
-					softMin = -400,
-					softMax = 400,
-					step = 1,
-					get = function() return NameplateSCT.db.global.yOffsetPersonal end,
-					set = function(_, newValue) NameplateSCT.db.global.yOffsetPersonal = newValue end,
-					order = 90,
-					width = "full",
-				},
-			},
-		},
-		formatting = {
-			type = 'group',
-			name = L["Text Formatting"],
-			order = 90,
-			inline = true,
-			disabled = function() return not NameplateSCT.db.global.enabled end,
-			args = {
-				truncateMethod = {
-					type = 'select',
-					name = L["Truncate Number"],
-					desc = L["Truncate Method:\n\nWestern:\n  1000=>1K,\n  1000K=>1M\nAsia East:\n  10000=>1w"],
-					get = function() return NameplateSCT.db.global.truncateMethod end,
-					set = function(_, newValue) NameplateSCT.db.global.truncateMethod = newValue end,
-					values = truncateMethod,
-					order = 1,
-				},
-				truncateLetter = {
-					type = 'toggle',
-					name = L["Show Truncated Letter"],
-					desc = "",
-					hidden = function () return NameplateSCT.db.global.truncateMethod == 'NONE' end,
-					-- disabled = function() return not NameplateSCT.db.global.enabled or NameplateSCT.db.global.truncateMethod == 'NONE' end,
-					get = function() return NameplateSCT.db.global.truncateLetter end,
-					set = function(_, newValue) NameplateSCT.db.global.truncateLetter = newValue end,
-					order = 2,
-				},
-				commaSeperate = {
-					type = 'toggle',
-					name = L["Comma Seperate"],
-					desc = "100000 -> 100,000",
-					hidden = function() return NameplateSCT.db.global.truncateMethod ~= 'NONE' end,
-					-- disabled = function() return not NameplateSCT.db.global.enabled or NameplateSCT.db.global.truncateMethod ~= 'WESTERN' end,
-					get = function() return NameplateSCT.db.global.commaSeperate end,
-					set = function(_, newValue) NameplateSCT.db.global.commaSeperate = newValue end,
-					order = 3,
-				},
-				divider = {
-					type = 'description',
-					name = "",
-					order = 50,
-					width = "full",
-				},
-				size = {
-					type = 'range',
-					name = L["Size"],
-					desc = "",
-					min = 5,
-					max = 72,
-					step = 1,
-					get = function() return NameplateSCT.db.global.formatting.size end,
-					set = function(_, newValue) NameplateSCT.db.global.formatting.size = newValue end,
-					order = 52,
-				},
-				alpha = {
-					type = 'range',
-					name = L["Alpha"],
-					desc = "",
-					min = 0.1,
-					max = 1,
-					step = .01,
-					get = function() return NameplateSCT.db.global.formatting.alpha end,
-					set = function(_, newValue) NameplateSCT.db.global.formatting.alpha = newValue end,
-					order = 53,
-				},
-
-				displayOffTargetText = {
-					type = 'toggle',
-					name = L['Display Off-Target Text'],
-					desc = "",
-					get = function() return NameplateSCT.db.global.displayOffTargetText end,
-					set = function(_, newValue) NameplateSCT.db.global.displayOffTargetText = newValue end,
-					order = 99,
-					width = "full",
-				},
-
-				useOffTargetAppearance = {
-					type = 'toggle',
-					name = L["Use Seperate Off-Target Text Appearance"],
-					desc = "",
-					disabled = function() return not NameplateSCT.db.global.displayOffTargetText end,
-					get = function() return NameplateSCT.db.global.useOffTargetAppearance end,
-					set = function(_, newValue) NameplateSCT.db.global.useOffTargetAppearance = newValue end,
-					order = 100,
-					width = "full",
-				},
-				offTarget = {
-					type = 'group',
-					name = L["Off-Target Text Appearance"],
-					disabled = function() return not NameplateSCT.db.global.useOffTargetAppearance or not NameplateSCT.db.global.displayOffTargetText end,
-					order = 101,
-					inline = true,
-					args = {
-						size = {
-							type = 'range',
-							name = L["Size"],
-							desc = "",
-							min = 5,
-							max = 72,
-							step = 1,
-							get = function() return NameplateSCT.db.global.offTargetFormatting.size end,
-							set = function(_, newValue) NameplateSCT.db.global.offTargetFormatting.size = newValue end,
-							order = 2,
-						},
-						alpha = {
-							type = 'range',
-							name = L["Alpha"],
-							desc = "",
-							min = 0.1,
-							max = 1,
-							step = .01,
-							get = function() return NameplateSCT.db.global.offTargetFormatting.alpha end,
-							set = function(_, newValue) NameplateSCT.db.global.offTargetFormatting.alpha = newValue end,
-							order = 3,
-						},
-					},
-				},
-			},
-		},
-		sizing = {
-			type = 'group',
-			name = L["Sizing Modifiers"],
-			order = 100,
-			inline = true,
-			disabled = function() return not NameplateSCT.db.global.enabled end,
-			args = {
-				crits = {
-					type = 'toggle',
-					name = L["Embiggen Crits"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.sizing.crits end,
-					set = function(_, newValue) NameplateSCT.db.global.sizing.crits = newValue end,
-					order = 1,
-				},
-				critsScale = {
-					type = 'range',
-					name = L["Embiggen Crits Scale"],
-					desc = "",
-					disabled = function() return not NameplateSCT.db.global.enabled or not NameplateSCT.db.global.sizing.crits end,
-					min = 1,
-					max = 3,
-					step = .01,
-					get = function() return NameplateSCT.db.global.sizing.critsScale end,
-					set = function(_, newValue) NameplateSCT.db.global.sizing.critsScale = newValue end,
-					order = 2,
-					width = "double",
-				},
-
-				miss = {
-					type = 'toggle',
-					name = L["Embiggen Miss/Parry/Dodge/etc"],
-					desc = "",
-					get = function() return NameplateSCT.db.global.sizing.miss end,
-					set = function(_, newValue) NameplateSCT.db.global.sizing.miss = newValue end,
-					order = 10,
-				},
-				missScale = {
-					type = 'range',
-					name = L["Embiggen Miss/Parry/Dodge/etc Scale"],
-					desc = "",
-					disabled = function() return not NameplateSCT.db.global.enabled or not NameplateSCT.db.global.sizing.miss end,
-					min = 1,
-					max = 3,
-					step = .01,
-					get = function() return NameplateSCT.db.global.sizing.missScale end,
-					set = function(_, newValue) NameplateSCT.db.global.sizing.missScale = newValue end,
-					order = 11,
-					width = "double",
-				},
-
-				smallHits = {
-					type = 'toggle',
-					name = L["Scale Down Small Hits"],
-					desc = L["Scale down hits that are below a running average of your recent damage output"],
-					disabled = function() return not NameplateSCT.db.global.enabled or NameplateSCT.db.global.sizing.smallHitsHide end,
-					get = function() return NameplateSCT.db.global.sizing.smallHits end,
-					set = function(_, newValue) NameplateSCT.db.global.sizing.smallHits = newValue end,
-					order = 20,
-				},
-				smallHitsScale = {
-					type = 'range',
-					name = L["Small Hits Scale"],
-					desc = "",
-					disabled = function() return not NameplateSCT.db.global.enabled or not NameplateSCT.db.global.sizing.smallHits or NameplateSCT.db.global.sizing.smallHitsHide end,
-					min = 0.33,
-					max = 1,
-					step = .01,
-					get = function() return NameplateSCT.db.global.sizing.smallHitsScale end,
-					set = function(_, newValue) NameplateSCT.db.global.sizing.smallHitsScale = newValue end,
-					order = 21,
-					width = "double",
-				},
-				smallHitsHide = {
-					type = 'toggle',
-					name = L["Hide Small Hits"],
-					desc = L["Hide hits that are below a running average of your recent damage output"],
-					get = function() return NameplateSCT.db.global.sizing.smallHitsHide end,
-					set = function(_, newValue) NameplateSCT.db.global.sizing.smallHitsHide = newValue end,
-					order = 22,
-				},
-				hideSmallHitsThreshold = {
-					type = 'range',
-					name = L["Hide Hits Threshold"],
-					desc = L["Hide hits that are below this threshold."],
-					min = 0,
-					max = 10000000,
-					softMax = 10000,
-					step = 1,
-					get = function() return NameplateSCT.db.global.sizing.hideSmallHitsThreshold end,
-					set = function(_, newValue) NameplateSCT.db.global.sizing.hideSmallHitsThreshold = newValue end,
-					order = 23,
-					width = "full",
-				},
-			},
 		},
 	},
 }
@@ -2274,12 +2096,12 @@ if isMidnight then
 		disableBlizzardFCT = {
 			type = 'toggle',
 			name = L["BlizzardSCT"],
-			get = function(_, newValue) return GetCVar("floatingCombatTextCombatDamage") == "1" end,
+			get = function() return GetCVar(blizzardCvar) == "1" end,
 			set = function(_, newValue)
 				if (newValue) then
-					SetCVar("floatingCombatTextCombatDamage", 1)
+					SetCVar(blizzardCvar, 1)
 				else
-					SetCVar("floatingCombatTextCombatDamage", 0)
+					SetCVar(blizzardCvar, 0)
 				end
 			end,
 			order = 4,
@@ -2296,78 +2118,56 @@ if isMidnight then
 			order = 6,
 			width = "full",
 		},
+		openDashboard = {
+			type = 'execute',
+			name = "Open NameplateSCT dashboard",
+			desc = "Opens the settings window. /nsct opens the same window.",
+			func = function() NameplateSCT:OpenMenu() end,
+			order = 7,
+			width = "full",
+		},
 	}
 end
 
-local filters = {
-	name = L["Filters"],
-	handler = NameplateSCT,
-	type = 'group',
-	args = {
-		enable = {
-			type = "toggle",
-			name = L["Enable"],
-			desc = "",
-			get = function() return NameplateSCT.db.global.filterEnabled end,
-			set = function(_, newValue) NameplateSCT.db.global.filterEnabled = newValue end,
-			order = 1,
-			width = 1,
-		},
-		inverseSpellFilter = {
-			type = "toggle",
-			name = L["Inverse Spell Filter"],
-			desc = L["Inverse the logic and only show the spells in the list instead of filtering them away."],
-			get = function() return NameplateSCT.db.global.inverseSpellFilter end,
-			set = function(_, newValue) NameplateSCT.db.global.inverseSpellFilter = newValue end,
-			order = 1.5,
-			width = 1,
-		},
-		inverseFilter = {
-			type = "toggle",
-			name = L["Inverse NPC Filter"],
-			desc = L["Inverse the logic and only show npc's in the list instead of filtering them away."],
-			get = function() return NameplateSCT.db.global.inverseNPCFilter end,
-			set = function(_, newValue) NameplateSCT.db.global.inverseNPCFilter = newValue end,
-			order = 1.5,
-			width = 1,
-		},
-		header = {
-			type = "header",
-			name = "",
-			order = 2,
-		},
-		spellList = {
-			type = "input",
-			name = L["Spells"],
-			multiline = 20,
-			desc = L["Spellid/Spellname seperated by line\n\nWhite hits/melee = melee\nMiss/Parry/Dodge/etc = missed"],
-			order = 3,
-			width = 1,
-			get = function() return NameplateSCT.db.global.filter end,
-			set = function(_, newValue) NameplateSCT:updateFilterTable(newValue) end,
-		},
-		npcList = {
-			type = "input",
-			name = L["NPCs"],
-			multiline = 20,
-			desc = L["NPC id (eg: 23682) seperated by line\n\n The example is the Headless Horseman."],
-			order = 4,
-			width = 1,
-			get = function() return NameplateSCT.db.global.npcFilter end,
-			set = function(_, newValue) NameplateSCT:updateNPCFilterTable(newValue) end,
-		}
-	},
-}
+-- The legacy AceConfig panel is where the AceDB profiles group lives (AceDBOptions builds
+-- an AceConfig table, which the custom window cannot render).
+function NameplateSCT:OpenLegacyOptions()
+	if not optionsMenuName then return end
+	if not Settings or not Settings.OpenToCategory then return end
+	pcall(Settings.OpenToCategory, optionsMenuName)
+end
 
 function NameplateSCT:OpenMenu()
-	Settings.OpenToCategory(optionsMenuName)
+	-- Options/Settings.lua owns the dashboard window. The AddOns panel is only a launcher
+	-- for it now, so a dashboard that is missing or throws is reported instead of falling
+	-- through to that panel - silently opening the wrong window is what made /nsct look
+	-- broken while the addon had in fact never built its own settings UI.
+	local openDashboard = self.OpenDashboard
+	if not openDashboard then
+		if self.Print then
+			self:Print("the settings window did not load; the NameplateSCT section in the AddOns options opens it.")
+		end
+		self:OpenLegacyOptions()
+		return
+	end
+
+	local opened, err = pcall(openDashboard, self)
+	if not opened and self.Print then
+		self:Print("could not open the settings window: " .. tostring(err))
+	end
 end
 
 function NameplateSCT:RegisterMenu()
+	-- AceDBOptions can only do anything now that settings live in the profile namespace.
+	local dbOptions = LibStub("AceDBOptions-3.0", true)
+	if dbOptions and menu.args then
+		local profiles = dbOptions:GetOptionsTable(self.db)
+		if profiles then
+			profiles.order = 900
+			menu.args.profiles = profiles
+		end
+	end
+
 	LibStub("AceConfigRegistry-3.0"):RegisterOptionsTable("NameplateSCT", menu)
 	_, optionsMenuName = LibStub("AceConfigDialog-3.0"):AddToBlizOptions("NameplateSCT", "NameplateSCT")
-	if not isMidnight then
-		LibStub("AceConfigRegistry-3.0"):RegisterOptionsTable("Filters", filters)
-		LibStub("AceConfigDialog-3.0"):AddToBlizOptions("Filters", L["Filters"], "NameplateSCT")
-	end
 end

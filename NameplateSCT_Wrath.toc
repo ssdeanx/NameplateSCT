@@ -1,5 +1,5 @@
-## Interface: 30405, 38002
-## Version: 1.55
+﻿## Interface: 30405, 38002
+## Version: 1.62
 ## Title: NameplateSCT
 ## Author: AcidBomb
 ## SavedVariables: NameplateSCTDB
@@ -12,3 +12,5 @@
 embeds.xml
 Locales\locale.xml
 NameplateSCT.lua
+Options\Widgets.lua
+Options\Settings.lua

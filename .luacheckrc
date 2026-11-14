@@ -6,11 +6,17 @@ globals = {
     -- WoW Globals
     "AceGUIWidgetLSMlists",
     "C_CombatLog",
+    "C_AddOns",
     "C_NamePlate",
     "C_Secrets",
     "C_Spell",
     "CombatLogGetCurrentEventInfo",
     "CreateFrame",
+    "GetAddOnMetadata",
+    "GetLocale",
+    "GameTooltip",
+    "GameFontHighlight",
+    "ChatFontNormal",
     "Enum",
     "GetBuildInfo",
     "GetCVar",
@@ -24,9 +30,13 @@ globals = {
     "UnitGUID",
     "UnitIsDead",
     "UnitIsUnit",
+    "UISpecialFrames",
+    "STANDARD_TEXT_FONT",
     "WOW_PROJECT_CAMELOT",
+    "WOW_PROJECT_MAINLINE",
     "WOW_PROJECT_ID",
     "bit",
+    "canaccessvalue",
     "issecretvalue",
     "strsplit",
 
@@ -49,3 +59,14 @@ ignore = {
     "212", -- unused argument
     "213", -- unused loop variable
 }
+
+-- The harness deliberately defines the client environment it tests against, so its
+-- global assignments are the point, not a leak.
+files["Tests/harness/*.lua"] = {
+    allow_defined_top = true,
+    -- the harness defines the whole client environment; the addon reads those globals
+    -- through _G, so luacheck cannot see the read from inside this file
+    ignore = { "111", "112", "131" }, -- the harness defines the client environment on purpose
+    globals = { "UnitExists", "GameTooltip", "CanAlert" },
+}
+files["Tests/**"] = { allow_defined_top = true }
