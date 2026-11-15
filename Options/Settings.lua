@@ -1046,19 +1046,25 @@ local function buildAppearance(content)
 
 	y = section(content, y, "COLOURS")
 
-	y = toggle(content, y, "Colour damage by school", "damageColor")
+	y = toggle(content, y, "Colour damage by school", "damageColor",
+		"Only used when the ability colour is off", nil, function() return not GetPath("useAbilityColor") end)
 	y = toggle(content, y, "Auto-attacks always white", "whiteAutoAttacks",
 		"Draw melee swings, Auto Shot, and wand shots in white (#FFFFFF); turn off to use yellow physical school colour")
+	y = toggle(content, y, "Use an ability colour", "useAbilityColor",
+		"Draw abilities in one colour instead of their spell school colour", nil, nil)
+	y = hexField(content, y, "Ability colour (hex)", "abilityColor", when("useAbilityColor"))
 	y = hexField(content, y, "Normal hit colour (hex)", "defaultColor",
-		function() return not GetPath("damageColor") end)
+		function() return not GetPath("damageColor") and not GetPath("useAbilityColor") end)
 	y = toggle(content, y, "Colour damage you take", "damageColorPersonal")
 	y = hexField(content, y, "Your damage taken (hex)", "defaultColorPersonal",
 		function() return not GetPath("damageColorPersonal") end)
 
 	y = section(content, y, "CRIT AND MISS COLOURS")
 
-	y = toggle(content, y, "Use a crit colour", "useCritColor", nil, nil, nil)
-	y = hexField(content, y, "Crit colour (hex)", "critColor", nil)
+	y = toggle(content, y, "Use a crit colour", "useCritColor",
+		"Off: a crit keeps the colour of the hit (swings stay white, abilities keep their school colour)",
+		nil, nil)
+	y = hexField(content, y, "Crit colour (hex)", "critColor", when("useCritColor"))
 	y = toggle(content, y, "Use a miss colour", "useMissColor")
 	y = hexField(content, y, "Miss colour (hex)", "missColor", when("useMissColor"))
 	y = toggle(content, y, "Use a miss colour on you", "useMissColorPersonal")

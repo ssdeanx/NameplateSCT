@@ -1,5 +1,5 @@
-## Interface: 110207, 120105, 16001
-## Version: 1.68
+## Interface: 120105, 16001
+## Version: 1.69
 ## Title: NameplateSCT
 ## Author: AcidBomb
 ## SavedVariables: NameplateSCTDB

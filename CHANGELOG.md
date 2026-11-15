@@ -1,5 +1,61 @@
 # NameplateSCT
 
+## [1.69] (2026-11-14)
+
+### Heal icons fall back to the spell name, and damage/miss gain the same GUID guards
+
+`HealEvent` took `spellName` from the combat log and never used it, so a heal whose payload
+carried no `spellId` (the parser clears id 0) drew its number without the icon even though the
+name identifies the spell.
+
+- **The name now reaches the icon lookup:** `HealEvent` forwards it to `DrawHeal`, which passes it
+  into `DisplayText`'s `spellName` slot, where `GetSpellTexture(spellId or spellName or "")`
+  already used it as the fallback. The `UNIT_COMBAT` heal caller passes no name, so
+  restricted-client healing is unchanged.
+- **Secret guard at the boundary:** the name is forwarded only after `isSecretValue(spellName)`
+  proves it plain, so a secret name can never reach `GetSpellTexture` and taint the icon lookup.
+  Losing the hint costs the icon only — the amount, which may legitimately stay secret, still
+  draws.
+- **Damage and misses close the same hole:** `DamageEvent` and `MissEvent` compared `guid` to the
+  player GUID and indexed `guidToUnit[guid]` unguarded, exactly what `HealEvent` was just hardened
+  against. Both now read the GUID once behind `isSecretValue`, skip the plate lookup when it is
+  secret, and `MissEvent` compares a single `onPlayer` flag instead of `playerGUID ~= guid` four
+  times.
+- **One guarded icon sink:** `DisplayText`, `DisplayIconWithoutText` and `DisplayTextOverkill` now
+  resolve their texture through a shared `iconTexture` helper, which takes the spell id first and
+  refuses a secret spell name — so every number (damage, miss, heal, overkill, icon-only) is
+  covered, not just heals.
+- **Removed `ColorText`:** the pre-1.64 colour helper was unreferenced dead code that still wove
+  `|Cff` codes into the text. Colour is a FontString property now, and a secret amount cannot be
+  concatenated, so the helper would have broken the secret contract had anything ever called it
+  again. `GetTextColor`, `GetHealColor` and `hexToRGB` are the only colour paths left.
+- **Cast tracker hardening:** the `UNIT_SPELLCAST_*` handlers ignore calls that arrive with no
+  event name, channels remember their `castGUID`, and `UNIT_SPELLCAST_CHANNEL_STOP` clears only the
+  channel that actually stopped instead of closing an unrelated one.
+
+### White auto-attacks, a yellow ability colour, and crits that keep the colour they had
+
+The colour rules painted every crit in one colour and gave abilities their spell-school colour, so
+a white swing crit turned yellow and a fireball drew orange instead of the yellow an ability is
+meant to have.
+
+- **Auto-attacks are white on their own switch:** melee swings, Auto Shot and wands take
+  `whiteAutoAttacks` and no longer depend on `damageColor` being on, so turning school colouring
+  off cannot turn swings yellow. `RANGE_DAMAGE` is now read as a ranged auto-attack instead of an
+  ability, so Auto Shot and wand shots are white on both combat paths.
+- **New `useAbilityColor` (default on) and `abilityColor` (default `ffff00`):** every
+  non-auto-attack hit draws in one ability colour. Turn it off and the existing `damageColor`
+  school colouring takes over exactly as before.
+- **`useCritColor` now defaults off:** a crit keeps the colour of the hit that produced it — a
+  white swing crit stays white, an ability crit keeps the ability colour. Turning the switch on
+  restores the single `critColor` override.
+- **Wired into `/nsct`:** the Colours page gains "Use an ability colour" and "Ability colour
+  (hex)"; the school toggle and the normal-hit field grey out while the ability colour owns the
+  decision, so no control silently does nothing.
+- **Secret safe:** every colour here comes from plain profile text resolved to numbers before the
+  text is written, and `GetTextColor` treats a secret spell name as "not an auto-attack" instead of
+  comparing it.
+
 ## [1.68] (2026-11-14)
 
 ### Hardened player-only attribution (`targettarget`, heals, swings, AoE) & `/nsct` controls

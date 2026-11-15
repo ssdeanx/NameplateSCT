@@ -1,5 +1,5 @@
-## Interface: 30405, 38002
-## Version: 1.68
+## Interface: 38002
+## Version: 1.69
 ## Title: NameplateSCT
 ## Author: AcidBomb
 ## SavedVariables: NameplateSCTDB

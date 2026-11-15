@@ -180,7 +180,7 @@ C_CombatLog = { IsCombatLogRestricted = function() return true end }
 local helpfulSpells = { [2061] = true, [774] = true, [109304] = true, [740] = true, [1243] = true }
 local harmfulSpells = { [133] = true, [19434] = true, [8050] = true, [1978] = true, [2643] = true, [1680] = true, [421] = true }
 C_Spell = {
-	GetSpellTexture = function() return nil end,
+	GetSpellTexture = function(spell) _G.__spellTextureArg = spell return nil end,
 	IsSpellHelpful = function(id) return helpfulSpells[id] == true end,
 	IsSpellHarmful = function(id) return harmfulSpells[id] == true end,
 	IsCurrentSpell = function(id) return _G.__currentSpells and _G.__currentSpells[id] == true or false end,
@@ -716,6 +716,30 @@ eq(NS.diagnostics.drawn, 0, "CLEU drops heals on you from other healers even whe
 NS:CombatFilter(0, "SPELL_HEAL", false, UnitGUID("player"), "Me", 0, 0,
 	UnitGUID("player"), "Me", 0, 0, 2061, "Flash Heal", 2, 120, 0, 0, false)
 eq(NS.diagnostics.drawn, 1, "CLEU draws heals you cast on yourself")
+
+-- The heal name is the icon fallback: it must reach GetSpellTexture when the cast carried no
+-- spell id, and a secret name must never be handed to that lookup.
+_G.__spellTextureArg = nil
+NS.diagnostics.drawn = 0
+NS:CombatFilter(0, "SPELL_HEAL", false, UnitGUID("player"), "Me", 0, 0,
+	UnitGUID("player"), "Me", 0, 0, 0, "Flash Heal", 2, 120, 0, 0, false)
+eq(NS.diagnostics.drawn, 1, "a heal whose cast had no spell id still draws")
+eq(_G.__spellTextureArg, "Flash Heal", "the heal name reaches the icon lookup")
+_G.__spellTextureArg = nil
+NS.diagnostics.drawn = 0
+NS:CombatFilter(0, "SPELL_HEAL", false, UnitGUID("player"), "Me", 0, 0,
+	UnitGUID("player"), "Me", 0, 0, 0, SECRET, 2, 120, 0, 0, false)
+eq(NS.diagnostics.drawn, 1, "a heal with a secret name still draws")
+ok(_G.__spellTextureArg ~= SECRET, "a secret heal name never reaches the icon lookup")
+
+-- One guarded icon sink serves heals, damage, misses, overkill and icon-only: a plain name
+-- resolves the icon, a secret one is dropped before GetSpellTexture sees it.
+_G.__spellTextureArg = nil
+NS:DisplayText(nil, "100", 20, "verticalUp", nil, false, "Riptide", "player", 1, 1, 1)
+eq(_G.__spellTextureArg, "Riptide", "a plain spell name resolves the icon")
+_G.__spellTextureArg = nil
+NS:DisplayText(nil, "100", 20, "verticalUp", nil, false, SECRET, "player", 1, 1, 1)
+ok(_G.__spellTextureArg == nil, "a secret spell name never reaches the icon lookup")
 NS.db.profile.personal = personalBefore
 plateFrames["nameplate2"] = nil
 _G.__friendlyUnits = nil
@@ -2268,9 +2292,14 @@ FireEvent("UNIT_COMBAT", "nameplate3", "WOUND", "", 600, SCHOOL_MASK_FIRE)
 eq(NS.diagnostics.drawn, 0, "changing target drops stale casts from hitting the new target")
 NS:ClearAttribution()
 
--- 8. Default colors: swings = white, physical abilities = yellow, crits = yellow.
-eq(NS.defaults.profile.useCritColor, true, "useCritColor defaults to true for yellow crits")
-eq(NS.defaults.profile.critColor, "ffff00", "critColor defaults to yellow (ffff00)")
+-- 8. Default colors: auto-attacks (melee and ranged) are white, abilities are the ability colour
+-- (yellow), and a crit keeps the colour of the hit that produced it.
+eq(NS.defaults.profile.useCritColor, false, "crits keep the source colour by default")
+eq(NS.defaults.profile.critColor, "ffff00", "critColor defaults to yellow (ffff00) when enabled")
+eq(NS.defaults.profile.useAbilityColor, true, "abilities draw in one colour by default")
+eq(NS.defaults.profile.abilityColor, "ffff00", "the ability colour defaults to yellow (ffff00)")
+NS.db.profile.useCritColor = false
+NS.db.profile.useAbilityColor = true
 
 _G.__now = 2010
 _G.__unitIsTarget = "nameplate1"
@@ -2299,8 +2328,8 @@ createdFontStrings = {}
 FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "CRITICAL", 320, SCHOOL_MASK_PHYSICAL)
 local swingCritFS = _G.__lastNumberFontString
 ok(swingCritFS and swingCritFS._textColor
-	and swingCritFS._textColor[1] > 0.99 and swingCritFS._textColor[2] > 0.99 and swingCritFS._textColor[3] < 0.01,
-	"melee swing crit is yellow (#FFFF00)")
+	and swingCritFS._textColor[1] > 0.99 and swingCritFS._textColor[2] > 0.99 and swingCritFS._textColor[3] > 0.99,
+	"melee swing crit stays white (#FFFFFF)")
 
 _G.__now = 2013
 createdFontStrings = {}
@@ -2310,7 +2339,7 @@ FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "CRITICAL", 1100, SCHOOL_MASK_FI
 local spellCritFS = _G.__lastNumberFontString
 ok(spellCritFS and spellCritFS._textColor
 	and spellCritFS._textColor[1] > 0.99 and spellCritFS._textColor[2] > 0.99 and spellCritFS._textColor[3] < 0.01,
-	"spell ability crit is yellow (#FFFF00)")
+	"a fire ability crit is the ability colour (yellow), not the school colour")
 
 FireEvent("PLAYER_LEAVE_COMBAT")
 
@@ -2324,6 +2353,37 @@ local autoShotFS = _G.__lastNumberFontString
 ok(autoShotFS and autoShotFS._textColor
 	and autoShotFS._textColor[1] > 0.99 and autoShotFS._textColor[2] > 0.99 and autoShotFS._textColor[3] > 0.99,
 	"Auto Shot normal hit is white (#FFFFFF)")
+
+-- The ability colour is a live setting: with it on an ability ignores its school, with it off the
+-- school colour comes back.
+local fireR, fireG, fireB = NS:GetTextColor(false, SCHOOL_MASK_FIRE, "Fireball", false)
+ok(fireR > 0.99 and fireG > 0.99 and fireB < 0.01,
+	"an ability uses the ability colour (#FFFF00), not the fire school colour")
+NS.db.profile.useAbilityColor = false
+fireR, fireG, fireB = NS:GetTextColor(false, SCHOOL_MASK_FIRE, "Fireball", false)
+ok(fireR > 0.99 and fireG > 0.4 and fireG < 0.6 and fireB < 0.01,
+	"turning the ability colour off restores the fire school colour (#FF8000)")
+NS.db.profile.useAbilityColor = true
+
+-- Ranged auto-attacks arrive as RANGE_DAMAGE carrying the shot's own name; they must read as a
+-- swing so they draw white instead of taking the ability colour.
+local realUnitGUID = UnitGUID
+UnitGUID = function(unit)
+	if unit == "nameplate1" then return "Creature-0-1-2-3-4" end
+	return realUnitGUID(unit)
+end
+NS:NAME_PLATE_UNIT_ADDED("NAME_PLATE_UNIT_ADDED", "nameplate1")
+UnitGUID = realUnitGUID
+
+_G.__now = 2015
+createdFontStrings = {}
+NS:CombatFilter(0, "RANGE_DAMAGE", false, UnitGUID("player"), "Me", 0, 0,
+	"Creature-0-1-2-3-4", "Mob", 0, 0, 75, "Auto Shot", SCHOOL_MASK_PHYSICAL, 210, 0, 0, 0, 0, false)
+local rangedFS = _G.__lastNumberFontString
+ok(rangedFS and rangedFS._textColor
+	and rangedFS._textColor[1] > 0.99 and rangedFS._textColor[2] > 0.99 and rangedFS._textColor[3] > 0.99,
+	"a ranged auto-attack (RANGE_DAMAGE) draws white")
+NS:NAME_PLATE_UNIT_REMOVED("NAME_PLATE_UNIT_REMOVED", "nameplate1")
 
 -- 9. Tightened heals: pinned Flash Heal & self-only Exhilaration do not leak off-target heals.
 _G.__friendlyUnits = { nameplate1 = true, nameplate2 = true }

@@ -327,8 +327,15 @@ local defaults = {
 		damageColor = true,
 		defaultColor = "ffffff",
 		whiteAutoAttacks = true,
-		useCritColor = true,
+		-- Off by default: a crit keeps the colour of the hit that produced it, so a white swing
+		-- crit stays white and an ability crit keeps the ability colour. Turn it on to override
+		-- every crit with critColor instead.
+		useCritColor = false,
 		critColor = "ffff00",
+		-- Abilities (everything that is not an auto-attack) draw in one colour. Turn this off to
+		-- colour them by spell school instead.
+		useAbilityColor = true,
+		abilityColor = "ffff00",
 		useMissColor = false,
 		missColor = "ffffff",
 
@@ -648,11 +655,17 @@ end
 ---@return number, number, number
 function NameplateSCT:GetTextColor(isPersonal, school, spellName, crit)
 	local profile = self.db.profile
+	-- A crit only changes the colour when the player asked for one crit colour. Otherwise it keeps
+	-- the colour of the hit that produced it: a white swing crit stays white.
 	if crit and profile.useCritColor then
 		return hexToRGB(profile.critColor)
 	end
+
+	-- A secret name cannot be compared, and it is not an auto-attack we could recognise anyway.
+	local autoAttack = (not isSecretValue(spellName)) and spellName == "melee"
+
 	if isPersonal then
-		if profile.damageColorPersonal and profile.whiteAutoAttacks ~= false and spellName == "melee" and DAMAGE_TYPE_COLORS.melee then
+		if profile.damageColorPersonal and profile.whiteAutoAttacks ~= false and autoAttack and DAMAGE_TYPE_COLORS.melee then
 			return hexToRGB(DAMAGE_TYPE_COLORS.melee)
 		end
 		if profile.damageColorPersonal and school and DAMAGE_TYPE_COLORS[school] then
@@ -660,8 +673,14 @@ function NameplateSCT:GetTextColor(isPersonal, school, spellName, crit)
 		end
 		return hexToRGB(profile.defaultColorPersonal)
 	end
-	if profile.damageColor and profile.whiteAutoAttacks ~= false and spellName == "melee" and DAMAGE_TYPE_COLORS.melee then
+	-- Auto-attacks are white on their own switch, so turning school colouring off cannot turn
+	-- swings yellow.
+	if profile.whiteAutoAttacks ~= false and autoAttack and DAMAGE_TYPE_COLORS.melee then
 		return hexToRGB(DAMAGE_TYPE_COLORS.melee)
+	end
+	-- Everything else is an ability: one colour, unless the player wanted school colours instead.
+	if profile.useAbilityColor then
+		return hexToRGB(profile.abilityColor)
 	end
 	if profile.damageColor and school and DAMAGE_TYPE_COLORS[school] then
 		return hexToRGB(DAMAGE_TYPE_COLORS[school])
@@ -1871,6 +1890,11 @@ function NameplateSCT:CombatFilter(_, clue, _, sourceGUID, _, sourceFlags, _, de
 					spellName, amount, overkill, _, _, _, absorbed, critical = "melee", ...
 				elseif (string.find(clue, "ENVIRONMENTAL")) then
 					spellName, amount, overkill, school, _, _, absorbed, critical = ...
+				elseif (string.find(clue, "RANGE_DAMAGE")) then
+					-- Auto Shot and wand shots are ranged auto-attacks, not abilities: keep the id
+					-- for the icon, but mark them "melee" so they take the white swing colour.
+					spellId, spellName, _, amount, overkill, school, _, _, absorbed, critical = ...
+					spellName = "melee"
 				else
 					spellId, spellName, _, amount, overkill, school, _, _, absorbed, critical = ...
 				end
@@ -2800,6 +2824,7 @@ function NameplateSCT:PLAYER_DEAD()
 end
 
 function NameplateSCT:UNIT_SPELLCAST_FAILED(event, unit, castGUID)
+	if not event then return end
 	if unit ~= "player" and unit ~= "pet" then return end
 	if castGUID then
 		pendingCastMeta[castGUID] = nil
@@ -2808,6 +2833,7 @@ function NameplateSCT:UNIT_SPELLCAST_FAILED(event, unit, castGUID)
 end
 
 function NameplateSCT:UNIT_SPELLCAST_SENT(event, unit, targetName, castGUID, spellID)
+	if not event then return end
 	if unit ~= "player" and unit ~= "pet" then return end
 	if not spellID or isSecretValue(spellID) then return end
 	local now = GetTime()
@@ -2831,6 +2857,7 @@ function NameplateSCT:UNIT_SPELLCAST_SENT(event, unit, targetName, castGUID, spe
 end
 
 function NameplateSCT:UNIT_SPELLCAST_START(event, unit, castGUID, spellID)
+	if not event then return end
 	if unit ~= "player" and unit ~= "pet" then return end
 	if not spellID or isSecretValue(spellID) then return end
 	if isHealCapableSpell(spellID) and castGUID and not pendingCastMeta[castGUID] then
@@ -2844,6 +2871,7 @@ function NameplateSCT:UNIT_SPELLCAST_START(event, unit, castGUID, spellID)
 end
 
 function NameplateSCT:UNIT_SPELLCAST_CHANNEL_START(event, unit, castGUID, spellID)
+	if not event then return end
 	if unit ~= "player" and unit ~= "pet" then return end
 	if not spellID or isSecretValue(spellID) then return end
 	local now = GetTime()
@@ -2855,7 +2883,7 @@ function NameplateSCT:UNIT_SPELLCAST_CHANNEL_START(event, unit, castGUID, spellI
 	if isHealCapableSpell(spellID) then
 		local meta = takeCastMeta(pendingCastMeta, lastSentCast, castGUID, spellID, now) or captureCastMeta(nil, true)
 		local isAoeHeal = AOE_HEAL_SPELLS[spellID] == true or (not isStrict and not metaHasPinnedTarget(meta))
-		activeHealChannel = { spellID = spellID, startedAt = now, isAoe = isAoeHeal, meta = meta }
+		activeHealChannel = { spellID = spellID, castGUID = castGUID, startedAt = now, isAoe = isAoeHeal, meta = meta }
 		lastHealCastTime, lastHealSpellID = now, spellID
 		lastHealPetOnly = (spellID == 136 or unit == "pet")
 		lastHealSelfOnly = SELF_ONLY_HEAL_SPELLS[spellID]
@@ -2873,6 +2901,7 @@ function NameplateSCT:UNIT_SPELLCAST_CHANNEL_START(event, unit, castGUID, spellI
 			or (not isStrict and not metaHasPinnedTarget(meta))
 		activeDamageChannel = {
 			spellID = spellID,
+			castGUID = castGUID,
 			startedAt = now,
 			isAoe = isAoe,
 			meta = meta,
@@ -2882,18 +2911,18 @@ function NameplateSCT:UNIT_SPELLCAST_CHANNEL_START(event, unit, castGUID, spellI
 end
 
 function NameplateSCT:UNIT_SPELLCAST_CHANNEL_STOP(event, unit, castGUID, spellID)
+	if not event then return end
 	if unit ~= "player" and unit ~= "pet" then return end
-	local now = GetTime()
-	if activeHealChannel then
-		lastHealCastTime = now
+	if activeHealChannel and (not castGUID or activeHealChannel.castGUID == castGUID or activeHealChannel.spellID == spellID) then
 		activeHealChannel = nil
 	end
-	if activeDamageChannel then
+	if activeDamageChannel and (not castGUID or activeDamageChannel.castGUID == castGUID or activeDamageChannel.spellID == spellID) then
 		activeDamageChannel = nil
 	end
 end
 
 function NameplateSCT:UNIT_SPELLCAST_SUCCEEDED(event, unit, castGUID, spellID)
+	if not event then return end
 	if unit ~= "player" and unit ~= "pet" then return end
 	if not spellID or isSecretValue(spellID) then return end
 	local now = GetTime()
@@ -3186,7 +3215,8 @@ local DAMAGE_CATEGORY = {
 ---@param crit boolean
 ---@param spellId any
 ---@param guid string?
-function NameplateSCT:DrawHeal(unit, amount, crit, spellId, guid)
+---@param spellName string? plain only; resolves the icon when the cast carried no spell id
+function NameplateSCT:DrawHeal(unit, amount, crit, spellId, guid, spellName)
 	local profile = self.db.profile
 	if not profile.showHealing then return countDrop("healing is off") end
 
@@ -3212,7 +3242,7 @@ function NameplateSCT:DrawHeal(unit, amount, crit, spellId, guid)
 	if not size or size < 5 then size = 5 end
 
 	local red, green, blue = self:GetHealColor(crit)
-	self:DisplayText(guid, text, size, animation, spellId, crit and true or false, nil, unit, red, green, blue)
+	self:DisplayText(guid, text, size, animation, spellId, crit and true or false, spellName, unit, red, green, blue)
 end
 
 --- Combat-log heals: the destination GUID names the unit that was healed.
@@ -3223,10 +3253,20 @@ end
 ---@param spellId any
 function NameplateSCT:HealEvent(guid, spellName, amount, crit, spellId)
 	if not self.db.profile.showHealing then return countDrop("healing is off") end
-	local onPlayer = guid == playerGUID
-	local unit = onPlayer and "player" or guidToUnit[guid]
+	local onPlayer = (not isSecretValue(guid)) and (guid == playerGUID)
+	local unit
+	if onPlayer then
+		unit = "player"
+	elseif not isSecretValue(guid) then
+		unit = guidToUnit[guid]
+	end
 	if not unit then return countDrop("no nameplate for unit") end
-	return self:DrawHeal(unit, amount, crit and true or false, spellId, onPlayer and nil or guid)
+	-- The name is only the icon fallback for casts that carried no spell id. A secret name must
+	-- never reach GetSpellTexture, so it is dropped here; the amount, which is allowed to stay
+	-- secret, still draws.
+	local plainSpellName
+	if spellName and not isSecretValue(spellName) then plainSpellName = spellName end
+	return self:DrawHeal(unit, amount, crit and true or false, spellId, onPlayer and nil or guid, plainSpellName)
 end
 
 function NameplateSCT:UNIT_COMBAT(event, unit, action, flagText, amount, schoolMask)
@@ -3488,7 +3528,10 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
 
 	amount = amount or 0
 	absorbed = absorbed or 0
-	local onPlayer = guid == playerGUID
+	-- A GUID can only be compared or used as a plate key when the client lets us read it; the
+	-- combat log hands over plain strings, and the guard is what proves that to the analyzer.
+	local plainGuid = not isSecretValue(guid)
+	local onPlayer = plainGuid and guid == playerGUID
 
 	-- Hide small hits: the relative threshold and the absolute minimum both apply
 	if not isSecretAmount and not isSecretAbsorbed then
@@ -3524,7 +3567,10 @@ function NameplateSCT:DamageEvent(guid, spellName, amount, overkill, school, cri
 		return countDrop("animation is disabled")
 	end
 
-	local unit = guidToUnit[guid]
+	local unit
+	if plainGuid then
+		unit = guidToUnit[guid]
+	end
 	local isTarget = safeUnitIsUnit(unit, "target")
 
 	if (not isTarget and not self.db.profile.displayOffTargetText) then
@@ -3609,10 +3655,15 @@ function NameplateSCT:MissEvent(guid, spellName, missType, spellId)
 	if not self.db.profile.showMisses then return end
 
 	local text, animation, pow, size, color
-	local unit = guidToUnit[guid]
+	local plainGuid = not isSecretValue(guid)
+	local unit
+	if plainGuid then
+		unit = guidToUnit[guid]
+	end
 	local isTarget = safeUnitIsUnit(unit, "target")
+	local onPlayer = plainGuid and guid == playerGUID
 
-	if playerGUID ~= guid then
+	if not onPlayer then
 		animation = self.db.profile.animations.miss
 		color = self.db.profile.useMissColor and self.db.profile.missColor or defaults.profile.missColor
 	else
@@ -3624,14 +3675,14 @@ function NameplateSCT:MissEvent(guid, spellName, missType, spellId)
 	-- No animation set, cancel out
 	if (animation == "disabled") then return countDrop("miss animation is disabled") end
 
-	if (self.db.profile.useOffTargetAppearance and not isTarget and playerGUID ~= guid) then
+	if (self.db.profile.useOffTargetAppearance and not isTarget and not onPlayer) then
 		size = self.db.profile.offTargetFormatting.size
 	else
 		size = self.db.profile.formatting.size
 	end
 
 	-- embiggen miss size
-	if self.db.profile.sizing.miss and playerGUID ~= guid then
+	if self.db.profile.sizing.miss and not onPlayer then
 		size = size * self.db.profile.sizing.missScale
 	end
 
@@ -3645,6 +3696,17 @@ function NameplateSCT:MissEvent(guid, spellName, missType, spellId)
 	local red, green, blue = hexToRGB(color)
 
 	self:DisplayText(guid, text, size, animation, spellId, pow, spellName, nil, red, green, blue)
+end
+
+-- The icon only needs a hint: the spell id first, then the name. A secret name must never reach
+-- GetSpellTexture, so the guard turns it into "no icon" instead of a tainted lookup. Heals,
+-- damage, misses, overkill and icon-only all resolve their texture through here.
+---@param spellId any
+---@param spellName any
+local function iconTexture(spellId, spellName)
+	if spellId then return GetSpellTexture(spellId) end
+	if spellName and not isSecretValue(spellName) then return GetSpellTexture(spellName) end
+	return nil
 end
 
 function NameplateSCT:DisplayText(guid, text, size, animation, spellId, pow, spellName, unitOverride, red, green, blue)
@@ -3712,7 +3774,7 @@ function NameplateSCT:DisplayText(guid, text, size, animation, spellId, pow, spe
 	fontString.guid = guid
 	fontString.screenMode = screenMode
 
-	local texture = GetSpellTexture(spellId or spellName or "")
+	local texture = iconTexture(spellId, spellName)
 	if NameplateSCT.db.profile.showIcon and texture then
 		icon = fontString.icon
 		icon:Show()
@@ -3772,7 +3834,7 @@ function NameplateSCT:DisplayIconWithoutText(guid, size, animation, spellId, pow
 
 		if unit == "player" and not nameplate then
 			nameplate = "player"
-		elseif guid and playerGUID == guid and not unit then
+		elseif guid and playerGUID and not isSecretValue(guid) and playerGUID == guid and not unit then
 			nameplate = "player"
 		elseif (not nameplate) then
 			return countDrop("no anchor for this number")
@@ -3795,7 +3857,7 @@ function NameplateSCT:DisplayIconWithoutText(guid, size, animation, spellId, pow
 	fontString.guid = guid
 	fontString.screenMode = screenMode
 
-	local texture = GetSpellTexture(spellId or spellName or "")
+	local texture = iconTexture(spellId, spellName)
 	if NameplateSCT.db.profile.showIcon and texture then
 		icon = fontString.icon
 		icon:Show()
@@ -3864,7 +3926,7 @@ function NameplateSCT:DisplayTextOverkill(guid, text, size, animation, spellId, 
 
 	fontString.unit = "player"
 	fontString.guid = guid
-	local texture = GetSpellTexture(spellId or spellName or "")
+	local texture = iconTexture(spellId, spellName)
 	if NameplateSCT.db.profile.showIcon and texture then
 		icon = fontString.icon
 		icon:Show()
@@ -3903,34 +3965,6 @@ function NameplateSCT:DisplayTextOverkill(guid, text, size, animation, spellId, 
 		duration = NameplateSCT.db.profile.animations.fireworksDuration
 	end
 	self:Animate(fontString, nameplate, duration, animation)
-end
-
-function NameplateSCT:ColorText(startingText, guid, pGUID, school, spellName, crit)
-	if isSecretValue(startingText) then
-		return startingText
-	end
-	local finalText
-	if guid ~= (pGUID or playerGUID) then
-		if crit and self.db.profile.useCritColor then
-			finalText = "|Cff" .. self.db.profile.critColor .. startingText .. "|r"
-		elseif self.db.profile.damageColor and self.db.profile.whiteAutoAttacks ~= false and spellName == "melee" and DAMAGE_TYPE_COLORS[spellName] then
-			finalText = "|Cff" .. DAMAGE_TYPE_COLORS[spellName] .. startingText .. "|r"
-		elseif self.db.profile.damageColor and school and DAMAGE_TYPE_COLORS[school] then
-			finalText = "|Cff" .. DAMAGE_TYPE_COLORS[school] .. startingText .. "|r"
-		else
-			finalText = "|Cff" .. self.db.profile.defaultColor .. startingText .. "|r"
-		end
-	else
-		if self.db.profile.damageColorPersonal and self.db.profile.whiteAutoAttacks ~= false and spellName == "melee" and DAMAGE_TYPE_COLORS[spellName] then
-			finalText = "|Cff" .. DAMAGE_TYPE_COLORS[spellName] .. startingText .. "|r"
-		elseif self.db.profile.damageColorPersonal and school and DAMAGE_TYPE_COLORS[school] then
-			finalText = "|Cff" .. DAMAGE_TYPE_COLORS[school] .. startingText .. "|r"
-		else
-			finalText = "|Cff" .. self.db.profile.defaultColorPersonal .. startingText .. "|r"
-		end
-	end
-
-	return finalText
 end
 
 -------------
