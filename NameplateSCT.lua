@@ -326,10 +326,17 @@ local defaults = {
 		},
 		damageColor = true,
 		defaultColor = "ffffff",
-		useCritColor = false,
+		whiteAutoAttacks = true,
+		useCritColor = true,
 		critColor = "ffff00",
 		useMissColor = false,
 		missColor = "ffffff",
+
+		-- Restricted-client attribution controls (Forever / Midnight). Ignored when CLEU is active.
+		attributionMode = "strict",
+		attributePlayerDots = true,
+		attributeAoeCasts = true,
+		attributePetTargets = true,
 
 		-- One switch per kind of hit the addon can draw, so every category the client reports
 		-- has a control instead of a yes for some and a silent no for others.
@@ -645,19 +652,19 @@ function NameplateSCT:GetTextColor(isPersonal, school, spellName, crit)
 		return hexToRGB(profile.critColor)
 	end
 	if isPersonal then
+		if profile.damageColorPersonal and profile.whiteAutoAttacks ~= false and spellName == "melee" and DAMAGE_TYPE_COLORS.melee then
+			return hexToRGB(DAMAGE_TYPE_COLORS.melee)
+		end
 		if profile.damageColorPersonal and school and DAMAGE_TYPE_COLORS[school] then
 			return hexToRGB(DAMAGE_TYPE_COLORS[school])
 		end
-		if profile.damageColorPersonal and spellName == "melee" and DAMAGE_TYPE_COLORS.melee then
-			return hexToRGB(DAMAGE_TYPE_COLORS.melee)
-		end
 		return hexToRGB(profile.defaultColorPersonal)
+	end
+	if profile.damageColor and profile.whiteAutoAttacks ~= false and spellName == "melee" and DAMAGE_TYPE_COLORS.melee then
+		return hexToRGB(DAMAGE_TYPE_COLORS.melee)
 	end
 	if profile.damageColor and school and DAMAGE_TYPE_COLORS[school] then
 		return hexToRGB(DAMAGE_TYPE_COLORS[school])
-	end
-	if profile.damageColor and spellName == "melee" and DAMAGE_TYPE_COLORS.melee then
-		return hexToRGB(DAMAGE_TYPE_COLORS.melee)
 	end
 	return hexToRGB(profile.defaultColor)
 end
@@ -1320,6 +1327,8 @@ function NameplateSCT:RegisterCastAttribution()
 				NameplateSCT:UNIT_SPELLCAST_CHANNEL_START(event, ...)
 			elseif event == "UNIT_SPELLCAST_CHANNEL_STOP" then
 				NameplateSCT:UNIT_SPELLCAST_CHANNEL_STOP(event, ...)
+			elseif event == "UNIT_SPELLCAST_FAILED" or event == "UNIT_SPELLCAST_INTERRUPTED" then
+				NameplateSCT:UNIT_SPELLCAST_FAILED(event, ...)
 			else
 				NameplateSCT:UNIT_SPELLCAST_SUCCEEDED(event, ...)
 			end
@@ -1333,6 +1342,8 @@ function NameplateSCT:RegisterCastAttribution()
 		"UNIT_SPELLCAST_CHANNEL_START",
 		"UNIT_SPELLCAST_CHANNEL_STOP",
 		"UNIT_SPELLCAST_SUCCEEDED",
+		"UNIT_SPELLCAST_FAILED",
+		"UNIT_SPELLCAST_INTERRUPTED",
 	}
 	for _, ev in ipairs(unitEvents) do
 		local ok = pcall(castFrame.RegisterUnitEvent, castFrame, ev, "player", "pet")
@@ -1350,8 +1361,16 @@ function NameplateSCT:OnEnable()
 
 	if hasCombatRestrictions then
 		-- Restricted client (Forever / Midnight): UNIT_COMBAT is the only permitted
-		-- damage source. Spell attribution comes from the player's own casts.
+		-- damage source. Attribution comes from the player's own casts, auto-attack state,
+		-- and player-filtered unit auras.
 		self:RegisterEvent("UNIT_COMBAT")
+		self:RegisterEvent("PLAYER_ENTER_COMBAT")
+		self:RegisterEvent("PLAYER_LEAVE_COMBAT")
+		self:RegisterEvent("START_AUTOREPEAT_SPELL")
+		self:RegisterEvent("STOP_AUTOREPEAT_SPELL")
+		self:RegisterEvent("PLAYER_TARGET_CHANGED")
+		self:RegisterEvent("PLAYER_REGEN_ENABLED")
+		self:RegisterEvent("PLAYER_DEAD")
 		self:RegisterCastAttribution()
 	else
 		pcall(self.RegisterEvent, self, "COMBAT_LOG_EVENT_UNFILTERED")
@@ -1385,7 +1404,9 @@ function NameplateSCT:OnDisable()
 	if self.castFrame then
 		self.castFrame:UnregisterAllEvents()
 	end
-	if self.ClearHealAttribution then
+	if self.ClearAttribution then
+		self:ClearAttribution()
+	elseif self.ClearHealAttribution then
 		self:ClearHealAttribution()
 	end
 
@@ -1758,6 +1779,10 @@ function NameplateSCT:NAME_PLATE_UNIT_REMOVED(event, unitID)
 		guidToUnit[guid] = nil
 	end
 
+	if self.ForgetUnitAttribution then
+		self:ForgetUnitAttribution(unitID)
+	end
+
 	-- recycle any fontStrings attached to this unit
 	for fontString, _ in pairs(animating) do
 		if fontString.unit == unitID then
@@ -1951,10 +1976,277 @@ local HIT_ACTIONS = {
 local MODERN_DUPLICATE_WINDOW = 0.05
 local ATTRIBUTION_WINDOW = 1.2
 local HEAL_CAST_WINDOW = 2.0
+local STRICT_HEAL_CAST_WINDOW = 1.6
 local HEAL_CHANNEL_MAX = 12.0
-local HEAL_HOT_WINDOW = 15.0
+local HEAL_HOT_WINDOW = 12.0
+local DAMAGE_CAST_WINDOW = 2.0
+local AOE_CAST_WINDOW = 1.8
+local STRICT_AOE_CAST_WINDOW = 1.4
+local GROUND_AOE_WINDOW = 8.0
+local DAMAGE_CHANNEL_MAX = 12.0
 local CAST_META_TTL = 15.0
 local MAX_TRACKED_HEAL_RECIPIENTS = 16
+local MAX_PENDING_DAMAGE_CASTS = 24
+local AUTO_ATTACK_SPELL_ID = 6603
+local AUTO_SHOT_SPELL_ID = 75
+local DEFAULT_SWING_SPEED = 1.6
+local STRICT_SWING_MIN_GAP = 0.55
+local STRICT_PET_SWING_GAP = 0.75
+
+-- Auto-repeat attacks tracked as white swings / ranged auto-shots rather than abilities.
+local AUTO_REPEAT_SPELLS = {
+	[75] = true,   -- Auto Shot
+	[2764] = true, -- Throw
+	[3018] = true, -- Shoot
+	[5019] = true, -- Shoot (Wand)
+	[6603] = true, -- Auto Attack
+}
+
+-- Helpful non-healing buffs, dispels, resurrections and utility spells that must never
+-- open a healing attribution window just because IsSpellHelpful returns true.
+local NON_HEAL_HELPFUL_SPELLS = {
+	[130] = true,   -- Slow Fall
+	[131] = true,   -- Water Breathing
+	[467] = true,   -- Thorns
+	[469] = true,   -- Commanding Shout
+	[475] = true,   -- Remove Curse
+	[527] = true,   -- Purify / Dispel Magic
+	[528] = true,   -- Dispel Magic / Cure Disease
+	[546] = true,   -- Water Walking
+	[1022] = true,  -- Blessing of Protection
+	[1044] = true,  -- Blessing of Freedom
+	[1126] = true,  -- Mark of the Wild
+	[1243] = true,  -- Power Word: Fortitude
+	[1459] = true,  -- Arcane Intellect
+	[2006] = true,  -- Resurrection
+	[2008] = true,  -- Ancestral Spirit
+	[3411] = true,  -- Intervene
+	[3714] = true,  -- Path of Frost
+	[4987] = true,  -- Cleanse
+	[5118] = true,  -- Aspect of the Cheetah
+	[5697] = true,  -- Unending Breath
+	[6346] = true,  -- Fear Ward
+	[6673] = true,  -- Battle Shout
+	[6940] = true,  -- Blessing of Sacrifice
+	[7328] = true,  -- Redemption
+	[10060] = true, -- Power Infusion
+	[19574] = true, -- Bestial Wrath
+	[19740] = true, -- Blessing of Might
+	[19742] = true, -- Blessing of Wisdom
+	[20217] = true, -- Blessing of Kings
+	[20484] = true, -- Rebirth
+	[20707] = true, -- Soulstone
+	[21562] = true, -- Power Word: Fortitude (Raid)
+	[29166] = true, -- Innervate
+	[34477] = true, -- Misdirection
+	[50769] = true, -- Revive
+	[51886] = true, -- Cleanse Spirit
+	[61999] = true, -- Raise Ally
+	[115178] = true, -- Resuscitate
+	[115450] = true, -- Detox
+	[116849] = true, -- Life Cocoon
+}
+
+-- Healing over time, ground-heal and passive-heal spells whose ticks continue past the initial cast.
+local HOT_HEAL_SPELLS = {
+	[139] = true,    -- Renew
+	[724] = true,    -- Lightwell
+	[740] = true,    -- Tranquility
+	[774] = true,    -- Rejuvenation
+	[974] = true,    -- Earth Shield
+	[5394] = true,   -- Healing Stream Totem
+	[8936] = true,   -- Regrowth
+	[28880] = true,  -- Gift of the Naaru
+	[33076] = true,  -- Prayer of Mending
+	[33763] = true,  -- Lifebloom
+	[48438] = true,  -- Wild Growth
+	[51945] = true,  -- Earthliving
+	[53563] = true,  -- Beacon of Light
+	[59542] = true,  -- Gift of the Naaru
+	[59543] = true,  -- Gift of the Naaru
+	[59544] = true,  -- Gift of the Naaru
+	[59545] = true,  -- Gift of the Naaru
+	[59547] = true,  -- Gift of the Naaru
+	[59548] = true,  -- Gift of the Naaru
+	[61295] = true,  -- Riptide
+	[64843] = true,  -- Divine Hymn
+	[73920] = true,  -- Healing Rain
+	[108280] = true, -- Healing Tide Totem
+	[115151] = true, -- Renewing Mist
+	[121093] = true, -- Gift of the Naaru
+	[124682] = true, -- Enveloping Mist
+	[145205] = true, -- Efflorescence
+	[355936] = true, -- Dream Breath
+	[364343] = true, -- Echo
+	[366155] = true, -- Reversion
+}
+
+-- Self-centered heals that only ever heal the caster (or caster + pet for Exhilaration), so
+-- they must not open a window that admits other players' heals on nearby allies.
+local SELF_ONLY_HEAL_SPELLS = {
+	[5512] = "self",         -- Create Healthstone
+	[6262] = "self",         -- Healthstone
+	[12975] = "self",        -- Last Stand
+	[19236] = "self",        -- Desperate Prayer
+	[22842] = "self",        -- Frenzied Regeneration
+	[34428] = "self",        -- Victory Rush
+	[49998] = "self",        -- Death Strike
+	[108238] = "self",       -- Renewal
+	[109304] = "self_or_pet", -- Exhilaration
+	[185311] = "self",       -- Crimson Vial
+	[202168] = "self",       -- Impending Victory
+	[234153] = "self",       -- Drain Life
+}
+
+-- Multi-target, splash, beacon or totem heals that legitimately land on friendly units other
+-- than a single explicit target.
+local AOE_HEAL_SPELLS = {
+	[596] = true,    -- Prayer of Healing
+	[724] = true,    -- Lightwell
+	[740] = true,    -- Tranquility
+	[1064] = true,   -- Chain Heal
+	[5394] = true,   -- Healing Stream Totem
+	[15237] = true,  -- Holy Nova
+	[15286] = true,  -- Vampiric Embrace
+	[28880] = true,  -- Gift of the Naaru
+	[33076] = true,  -- Prayer of Mending
+	[34861] = true,  -- Circle of Healing / Holy Word: Sanctify
+	[48438] = true,  -- Wild Growth
+	[59542] = true,  -- Gift of the Naaru
+	[59543] = true,  -- Gift of the Naaru
+	[59544] = true,  -- Gift of the Naaru
+	[59545] = true,  -- Gift of the Naaru
+	[59547] = true,  -- Gift of the Naaru
+	[59548] = true,  -- Gift of the Naaru
+	[64843] = true,  -- Divine Hymn
+	[73920] = true,  -- Healing Rain
+	[85222] = true,  -- Light of Dawn
+	[88685] = true,  -- Holy Word: Sanctify
+	[98008] = true,  -- Spirit Link Totem
+	[108280] = true, -- Healing Tide Totem
+	[110744] = true, -- Divine Star
+	[114165] = true, -- Holy Prism
+	[115310] = true, -- Revival
+	[120517] = true, -- Halo
+	[120644] = true, -- Halo
+	[121093] = true, -- Gift of the Naaru
+	[123986] = true, -- Chi Burst
+	[132157] = true, -- Holy Nova
+	[145205] = true, -- Efflorescence
+	[157153] = true, -- Cloudburst Totem
+	[191837] = true, -- Essence Font
+	[194509] = true, -- Power Word: Radiance
+	[196725] = true, -- Refreshing Jade Wind
+	[197995] = true, -- Wellspring
+	[207778] = true, -- Downpour
+	[323764] = true, -- Convoke the Spirits
+	[355913] = true, -- Emerald Blossom
+	[355936] = true, -- Dream Breath
+	[363534] = true, -- Rewind
+	[367226] = true, -- Spiritbloom
+	[391528] = true, -- Convoke the Spirits
+}
+
+-- Spells that can deal damage even when the client also considers them helpful.
+local DUAL_USE_DAMAGE_SPELLS = {
+	[15237] = true,  -- Holy Nova
+	[20473] = true,  -- Holy Shock
+	[47540] = true,  -- Penance
+	[110744] = true, -- Divine Star
+	[120644] = true, -- Halo
+	[132157] = true, -- Holy Nova
+	[194509] = true, -- Power Word: Radiance
+	[323764] = true, -- Convoke the Spirits
+	[391528] = true, -- Convoke the Spirits
+}
+
+-- Multi-target, cleave, chain or placed AoE offensive spells that hit units other than the
+-- current single target.
+local AOE_DAMAGE_SPELLS = {
+	[10] = true,     -- Blizzard
+	[120] = true,    -- Cone of Cold
+	[421] = true,    -- Chain Lightning
+	[779] = true,    -- Swipe
+	[845] = true,    -- Cleave
+	[1449] = true,   -- Arcane Explosion
+	[1535] = true,   -- Fire Nova
+	[1680] = true,   -- Whirlwind
+	[1949] = true,   -- Hellfire
+	[2120] = true,   -- Flamestrike
+	[2643] = true,   -- Multi-Shot
+	[3599] = true,   -- Searing Totem
+	[5740] = true,   -- Rain of Fire
+	[6343] = true,   -- Thunder Clap
+	[8190] = true,   -- Magma Totem
+	[11113] = true,  -- Blast Wave
+	[12328] = true,  -- Sweeping Strikes
+	[13813] = true,  -- Explosive Trap
+	[13877] = true,  -- Blade Flurry
+	[15237] = true,  -- Holy Nova
+	[16914] = true,  -- Hurricane
+	[20424] = true,  -- Seals of Command / Hammer of the Righteous
+	[26573] = true,  -- Consecration
+	[27243] = true,  -- Seed of Corruption
+	[42223] = true,  -- Rain of Fire
+	[43265] = true,  -- Death and Decay
+	[46968] = true,  -- Shockwave
+	[47897] = true,  -- Shadowflame
+	[48045] = true,  -- Mind Sear
+	[48505] = true,  -- Starfall
+	[49184] = true,  -- Howling Blast
+	[50842] = true,  -- Pestilence
+	[51490] = true,  -- Thunderstorm
+	[51723] = true,  -- Fan of Knives
+	[53385] = true,  -- Divine Storm
+	[53595] = true,  -- Hammer of the Righteous
+	[61882] = true,  -- Earthquake
+	[77758] = true,  -- Thrash
+	[101546] = true, -- Spinning Crane Kick
+	[106785] = true, -- Swipe
+	[106830] = true, -- Thrash
+	[115181] = true, -- Breath of Fire
+	[121411] = true, -- Crimson Tempest
+	[132157] = true, -- Holy Nova
+	[152277] = true, -- Ravager
+	[152280] = true, -- Defile
+	[188443] = true, -- Chain Lightning
+	[190356] = true, -- Blizzard
+	[190411] = true, -- Whirlwind
+	[191034] = true, -- Starfall
+	[194386] = true, -- Volley
+	[196770] = true, -- Remorseless Winter
+	[198013] = true, -- Eye Beam
+	[213771] = true, -- Swipe
+	[228920] = true, -- Ravager
+	[257620] = true, -- Multi-Shot
+	[258920] = true, -- Immolation Aura
+	[260243] = true, -- Volley
+	[357208] = true, -- Fire Breath
+	[357210] = true, -- Deep Breath
+	[359073] = true, -- Eternity Surge
+}
+
+-- Ground/totem AoE effects whose damage arrives over several seconds after the cast.
+local GROUND_AOE_DAMAGE_SPELLS = {
+	[10] = true,     -- Blizzard
+	[2120] = true,   -- Flamestrike
+	[5740] = true,   -- Rain of Fire
+	[8190] = true,   -- Magma Totem
+	[13813] = true,  -- Explosive Trap
+	[16914] = true,  -- Hurricane
+	[26573] = true,  -- Consecration
+	[42223] = true,  -- Rain of Fire
+	[43265] = true,  -- Death and Decay
+	[48505] = true,  -- Starfall
+	[61882] = true,  -- Earthquake
+	[152277] = true, -- Ravager
+	[152280] = true, -- Defile
+	[190356] = true, -- Blizzard
+	[191034] = true, -- Starfall
+	[194386] = true, -- Volley
+	[228920] = true, -- Ravager
+	[260243] = true, -- Volley
+}
 
 -- Ground, self-centered, totem and dual-use healing spells whose IsSpellHelpful query may
 -- return false on some clients because they do not take a friendly unit target directly.
@@ -2013,32 +2305,84 @@ local HEAL_CAPABLE_SPELLS = {
 
 local modernLastHit = {}
 local attributedSpellID, attributedSpellTime
+local autoAttackMelee = false
+local autoAttackRanged = false
+
 local pendingCastMeta = {}
 local lastSentCast
 local activeHealChannel
 local lastHealCastTime, lastHealSpellID, lastHealPetOnly
+local lastHealSelfOnly, lastHealAoe, lastHealHitsLeft, lastHealCastMeta
 local recentHealRecipients = {}
 
-local function clearHealAttributionState()
+local pendingDamageMeta = {}
+local lastSentDamageCast
+local activeDamageChannel
+local pendingDamageCasts = {}
+local lastAutoFallbackAt = 0
+local lastPetFallbackAt = 0
+
+local function clearAttributionState()
 	attributedSpellID, attributedSpellTime = nil, nil
+	autoAttackMelee = false
+	autoAttackRanged = false
 	pendingCastMeta = {}
 	lastSentCast = nil
 	activeHealChannel = nil
 	lastHealCastTime, lastHealSpellID, lastHealPetOnly = nil, nil, nil
+	lastHealSelfOnly, lastHealAoe, lastHealHitsLeft, lastHealCastMeta = nil, nil, nil, nil
 	recentHealRecipients = {}
+	pendingDamageMeta = {}
+	lastSentDamageCast = nil
+	activeDamageChannel = nil
+	pendingDamageCasts = {}
+	lastAutoFallbackAt = 0
+	lastPetFallbackAt = 0
+end
+
+function NameplateSCT:ClearAttribution()
+	clearAttributionState()
 end
 
 function NameplateSCT:ClearHealAttribution()
-	clearHealAttributionState()
+	clearAttributionState()
+end
+
+---@param unit string?
+---@return boolean
+local function safeUnitExists(unit)
+	if not unit or type(_G.UnitExists) ~= "function" then return false end
+	local ok, exists = pcall(_G.UnitExists, unit)
+	if not ok or not canaccessvalue(exists) or isSecretValue(exists) then return false end
+	return exists == true
+end
+
+---@param unit string?
+---@return boolean canAttack, boolean known
+local function safeUnitAttackable(unit)
+	if not unit or unit == "player" or unit == "pet" then return false, true end
+	local canAttackFn = _G.UnitCanAttack
+	if type(canAttackFn) ~= "function" then return false, false end
+	local ok, result = pcall(canAttackFn, "player", unit)
+	if not ok or not canaccessvalue(result) or isSecretValue(result) then return false, false end
+	return result == true, true
 end
 
 ---@param unit string?
 ---@return boolean
 local function safeUnitCanAttack(unit)
-	if not unit or unit == "player" or unit == "pet" then return false end
-	local canAttackFn = _G.UnitCanAttack
-	if type(canAttackFn) ~= "function" then return false end
-	local ok, result = pcall(canAttackFn, "player", unit)
+	local canAttack, known = safeUnitAttackable(unit)
+	return known and canAttack
+end
+
+---@param unit string?
+---@return boolean
+local function safeUnitIsFriend(unit)
+	if not unit then return false end
+	if unit == "player" or unit == "pet" then return true end
+	local isFriendFn = _G.UnitIsFriend
+	if type(isFriendFn) ~= "function" then return false end
+	local ok, result = pcall(isFriendFn, "player", unit)
 	if not ok or not canaccessvalue(result) or isSecretValue(result) then return false end
 	return result == true
 end
@@ -2064,11 +2408,75 @@ local function namesMatch(left, right)
 	return shortLeft ~= nil and shortLeft ~= "" and shortLeft == shortRight
 end
 
+---@param unit string?
+---@param filter string
+---@return boolean
+local function hasPlayerAura(unit, filter)
+	if not unit or isSecretValue(unit) then return false end
+	local getAuraIdsFn = C_UnitAuras and C_UnitAuras.GetUnitAuraInstanceIDs
+	if type(getAuraIdsFn) ~= "function" then return false end
+	local ok, ids = pcall(getAuraIdsFn, unit, filter, 1)
+	if not ok or not canaccessvalue(ids) or isSecretValue(ids) or type(ids) ~= "table" then
+		return false
+	end
+	return #ids > 0
+end
+
+---@param unit string?
+---@return boolean engaged, boolean known
+local function isUnitEngagedWithPlayer(unit)
+	if not unit or isSecretValue(unit) then return false, false end
+	local threatFn = _G.UnitThreatSituation
+	if type(threatFn) ~= "function" then return false, false end
+	local ok, status = pcall(threatFn, "player", unit)
+	if not ok or not canaccessvalue(status) or isSecretValue(status) then return false, false end
+	return status ~= nil, true
+end
+
+---@param spellID number
+---@return boolean
+local function safeIsCurrentSpell(spellID)
+	local currentFn = (C_Spell and C_Spell.IsCurrentSpell) or _G.IsCurrentSpell
+	if type(currentFn) ~= "function" then return false end
+	local ok, current = pcall(currentFn, spellID)
+	if not ok or not canaccessvalue(current) or isSecretValue(current) then return false end
+	return current == true
+end
+
+---@return boolean
+local function isAutoAttacking()
+	if autoAttackMelee or autoAttackRanged then
+		return true
+	end
+	return safeIsCurrentSpell(AUTO_ATTACK_SPELL_ID) or safeIsCurrentSpell(AUTO_SHOT_SPELL_ID)
+end
+
+---@return number
+local function strictSwingGap()
+	local speedFn = _G.UnitAttackSpeed
+	if type(speedFn) == "function" then
+		local ok, mainSpeed, offSpeed = pcall(speedFn, "player")
+		if ok and canaccessvalue(mainSpeed) and not isSecretValue(mainSpeed)
+			and type(mainSpeed) == "number" and mainSpeed > 0.2
+		then
+			local base = mainSpeed
+			if canaccessvalue(offSpeed) and not isSecretValue(offSpeed)
+				and type(offSpeed) == "number" and offSpeed > 0.2
+			then
+				base = math.min(mainSpeed, offSpeed) * 0.5
+			end
+			return math.max(STRICT_SWING_MIN_GAP, math.min(2.2, base * 0.65))
+		end
+	end
+	return math.max(STRICT_SWING_MIN_GAP, DEFAULT_SWING_SPEED * 0.65)
+end
+
 ---@param spellID any
 ---@return boolean
 local function isHealCapableSpell(spellID)
 	if not spellID or isSecretValue(spellID) or type(spellID) ~= "number" then return false end
-	if HEAL_CAPABLE_SPELLS[spellID] then return true end
+	if NON_HEAL_HELPFUL_SPELLS[spellID] then return false end
+	if HEAL_CAPABLE_SPELLS[spellID] or HOT_HEAL_SPELLS[spellID] then return true end
 	local helpfulFn = (C_Spell and C_Spell.IsSpellHelpful) or _G.IsHelpfulSpell
 	if type(helpfulFn) ~= "function" then return false end
 	local ok, helpful = pcall(helpfulFn, spellID)
@@ -2076,64 +2484,167 @@ local function isHealCapableSpell(spellID)
 	return helpful == true
 end
 
-local function inspectCastTarget(token)
-	if not token or type(_G.UnitExists) ~= "function" then return nil end
-	local okExists, exists = pcall(_G.UnitExists, token)
-	if not okExists or not canaccessvalue(exists) or isSecretValue(exists) or exists ~= true then
-		return nil
+---@param spellID any
+---@return boolean
+local function isDamageCapableSpell(spellID)
+	if not spellID or isSecretValue(spellID) or type(spellID) ~= "number" then return false end
+	if DUAL_USE_DAMAGE_SPELLS[spellID]
+		or AOE_DAMAGE_SPELLS[spellID]
+		or GROUND_AOE_DAMAGE_SPELLS[spellID]
+		or AUTO_REPEAT_SPELLS[spellID]
+	then
+		return true
 	end
-	if safeUnitCanAttack(token) then return nil end
+	if NON_HEAL_HELPFUL_SPELLS[spellID] or HEAL_CAPABLE_SPELLS[spellID] or HOT_HEAL_SPELLS[spellID] then
+		return false
+	end
+	local harmfulFn = (C_Spell and C_Spell.IsSpellHarmful) or _G.IsHarmfulSpell
+	if type(harmfulFn) == "function" then
+		local ok, harmful = pcall(harmfulFn, spellID)
+		if ok and canaccessvalue(harmful) and not isSecretValue(harmful) then
+			return harmful == true
+		end
+	end
+	return false
+end
+
+---@param spellID number
+---@param targetName any
+---@param isStrict boolean
+---@return boolean
+local function isAoeDamageSpell(spellID, targetName, isStrict)
+	if AOE_DAMAGE_SPELLS[spellID] or GROUND_AOE_DAMAGE_SPELLS[spellID] then return true end
+	if AUTO_REPEAT_SPELLS[spellID] or isStrict then return false end
+	if targetName == nil or targetName == "" then
+		return true
+	end
+	return false
+end
+
+---@param token string
+---@param wantFriendly boolean
+---@return table?
+local function inspectCastTarget(token, wantFriendly)
+	if not safeUnitExists(token) then return nil end
+	if wantFriendly then
+		if safeUnitCanAttack(token) then return nil end
+	else
+		if safeUnitIsFriend(token) then return nil end
+		local canAttack, known = safeUnitAttackable(token)
+		if known and not canAttack then return nil end
+	end
 	local plate = getNamePlateForUnit(token)
 	local isSelf, selfKnown = safeUnitIsUnit(token, "player")
 	local isPet, petKnown = safeUnitIsUnit(token, "pet")
+	local isTarget, targetKnown = safeUnitIsUnit(token, "target")
+	local isPetTarget = safeUnitExists("pet") and select(1, safeUnitIsUnit(token, "pettarget")) or false
 	local name = (not plate) and safeUnitName(token) or nil
-	if not plate and not (selfKnown and isSelf) and not (petKnown and isPet) and not name then
+	if not plate and not (selfKnown and isSelf) and not (petKnown and isPet)
+		and not (targetKnown and isTarget) and not isPetTarget and not name
+	then
 		return nil
 	end
 	return {
 		plate = plate,
 		isPlayer = (selfKnown and isSelf) or false,
 		isPet = (petKnown and isPet) or false,
+		isTarget = (token == "target") or (targetKnown and isTarget) or false,
+		isPetTarget = isPetTarget,
 		name = name,
 	}
 end
 
-local function captureFriendlyCastMeta(targetName)
-	local meta = inspectCastTarget("mouseover") or inspectCastTarget("target") or {}
+---@param targetName any
+---@param wantFriendly boolean
+---@return table
+local function captureCastMeta(targetName, wantFriendly)
+	local meta = inspectCastTarget("mouseover", wantFriendly)
+		or inspectCastTarget("target", wantFriendly)
+		or {}
 	if type(targetName) == "string" and canaccessvalue(targetName) and not isSecretValue(targetName) and targetName ~= "" then
 		meta.name = targetName
-		local playerName = safeUnitName("player")
-		if playerName and namesMatch(targetName, playerName) then
-			meta.isPlayer = true
+		meta.rawTargetName = targetName
+		if wantFriendly then
+			local playerName = safeUnitName("player")
+			if playerName and namesMatch(targetName, playerName) then
+				meta.isPlayer = true
+			end
 		end
 	end
 	meta.time = GetTime()
 	return meta
 end
 
-local function pruneExpiredHeals(now)
+local function metaHasPinnedTarget(meta)
+	if not meta then return false end
+	return meta.plate ~= nil or meta.isPlayer == true or meta.isPet == true
+		or meta.isTarget == true or meta.isPetTarget == true or meta.name ~= nil
+end
+
+---@param unit string
+---@param plate any
+---@param isPlayer boolean
+---@param isPetUnit boolean
+---@param unitName string?
+---@param onTarget boolean
+---@param entry table
+---@return boolean
+local function unitMatchesMeta(unit, plate, isPlayer, isPetUnit, unitName, onTarget, entry)
+	if entry.isPlayer and isPlayer then return true end
+	if entry.isPet and isPetUnit then return true end
+	if entry.plate and plate and entry.plate == plate then return true end
+	if entry.isTarget and (onTarget or unit == "target") then return true end
+	if entry.isPetTarget and safeUnitExists("pet") and select(1, safeUnitIsUnit(unit, "pettarget")) then
+		return true
+	end
+	if entry.name and unitName and namesMatch(entry.name, unitName) then return true end
+	return false
+end
+
+local function pruneTimedList(list, now, maxAge, extraInvalidFn)
+	local write = 1
+	for read = 1, #list do
+		local entry = list[read]
+		local age = now - (entry.time or 0)
+		local valid = age >= 0 and age <= (entry.window or maxAge)
+		if valid and extraInvalidFn and extraInvalidFn(entry) then
+			valid = false
+		end
+		if valid then
+			if write ~= read then list[write] = entry end
+			write = write + 1
+		end
+	end
+	for i = write, #list do
+		list[i] = nil
+	end
+end
+
+local function pruneExpiredAttribution(now)
 	for guid, entry in pairs(pendingCastMeta) do
 		local age = now - (entry.time or 0)
 		if age < 0 or age > CAST_META_TTL then
 			pendingCastMeta[guid] = nil
 		end
 	end
-	local write = 1
-	for read = 1, #recentHealRecipients do
-		local entry = recentHealRecipients[read]
+	for guid, entry in pairs(pendingDamageMeta) do
 		local age = now - (entry.time or 0)
-		if age >= 0 and age <= HEAL_HOT_WINDOW then
-			if write ~= read then recentHealRecipients[write] = entry end
-			write = write + 1
+		if age < 0 or age > CAST_META_TTL then
+			pendingDamageMeta[guid] = nil
 		end
 	end
-	for i = write, #recentHealRecipients do
-		recentHealRecipients[i] = nil
-	end
+	pruneTimedList(recentHealRecipients, now, HEAL_HOT_WINDOW)
+	pruneTimedList(pendingDamageCasts, now, GROUND_AOE_WINDOW, function(entry)
+		return (entry.hitsLeft or 0) <= 0
+	end)
 end
 
 local function recordHealRecipient(spellID, meta, castUnit, now)
 	local isPetCast = (spellID == 136 or castUnit == "pet")
+	local isHot = HOT_HEAL_SPELLS[spellID] == true
+	-- Only ongoing HoTs/petMend linger past the initial direct heal window; a direct single-target
+	-- heal must not leave its target open to attribute another healer's direct casts seconds later.
+	if not isHot and not isPetCast then return end
 	if not meta and not isPetCast then return end
 	local plate = meta and meta.plate or nil
 	local name = meta and meta.name or nil
@@ -2152,6 +2663,7 @@ local function recordHealRecipient(spellID, meta, castUnit, now)
 			entry.time = now
 			entry.plate = plate or entry.plate
 			entry.name = name or entry.name
+			entry.isHot = entry.isHot or isHot
 			return
 		end
 	end
@@ -2164,60 +2676,220 @@ local function recordHealRecipient(spellID, meta, castUnit, now)
 		name = name,
 		isPlayer = isPlayer,
 		isPet = isPet,
+		isHot = isHot,
 		spellID = spellID,
 		time = now,
 	}
 end
 
-local function takeCastMeta(castGUID, spellID, now)
-	local meta = castGUID and pendingCastMeta[castGUID] or nil
-	if castGUID then pendingCastMeta[castGUID] = nil end
-	if not meta and lastSentCast then
-		local age = now - (lastSentCast.time or 0)
-		if lastSentCast.spellID == spellID and age >= 0 and age <= CAST_META_TTL then
-			meta = lastSentCast.meta
+local function takeCastMeta(pendingMap, lastSent, castGUID, spellID, now)
+	local meta = castGUID and pendingMap[castGUID] or nil
+	if castGUID then pendingMap[castGUID] = nil end
+	if not meta and lastSent then
+		local age = now - (lastSent.time or 0)
+		if lastSent.spellID == spellID and age >= 0 and age <= CAST_META_TTL then
+			meta = lastSent.meta
 		end
 	end
 	return meta
 end
 
+local function recordDamageCast(spellID, meta, castUnit, now)
+	local isAoe = (meta and meta.isAoe) or AOE_DAMAGE_SPELLS[spellID] or false
+	local isAuto = AUTO_REPEAT_SPELLS[spellID] == true
+	local window = DAMAGE_CAST_WINDOW
+	local hitsLeft = 1
+	if GROUND_AOE_DAMAGE_SPELLS[spellID] then
+		isAoe = true
+		window = GROUND_AOE_WINDOW
+		hitsLeft = 40
+	elseif isAoe then
+		window = AOE_CAST_WINDOW
+		hitsLeft = 24
+	elseif isAuto then
+		window = 1.5
+		hitsLeft = 1
+	end
+
+	if #pendingDamageCasts >= MAX_PENDING_DAMAGE_CASTS then
+		table.remove(pendingDamageCasts, 1)
+	end
+	pendingDamageCasts[#pendingDamageCasts + 1] = {
+		spellID = spellID,
+		time = now,
+		window = window,
+		hitsLeft = hitsLeft,
+		isAoe = isAoe,
+		isAutoAttack = isAuto,
+		plate = meta and meta.plate or nil,
+		isTarget = (meta and meta.isTarget) or false,
+		isPet = (castUnit == "pet") or (meta and meta.isPetTarget or false),
+		name = meta and meta.name or nil,
+	}
+end
+
+function NameplateSCT:ForgetUnitAttribution(unitID)
+	if not unitID or isSecretValue(unitID) then return end
+	local plate = getNamePlateForUnit(unitID)
+	local isTargetToken = (unitID == "target")
+
+	local function invalidateMeta(meta)
+		if not meta then return end
+		if plate and meta.plate == plate then
+			meta.plate = nil
+		end
+		if isTargetToken and meta.isTarget then
+			meta.isTarget = false
+		end
+	end
+
+	for _, meta in pairs(pendingCastMeta) do invalidateMeta(meta) end
+	for _, meta in pairs(pendingDamageMeta) do invalidateMeta(meta) end
+	if lastSentCast then invalidateMeta(lastSentCast.meta) end
+	if lastSentDamageCast then invalidateMeta(lastSentDamageCast.meta) end
+	invalidateMeta(lastHealCastMeta)
+
+	for i = #pendingDamageCasts, 1, -1 do
+		local entry = pendingDamageCasts[i]
+		if (plate and entry.plate == plate) or (isTargetToken and entry.isTarget) then
+			if not entry.isAoe then
+				table.remove(pendingDamageCasts, i)
+			else
+				if plate and entry.plate == plate then entry.plate = nil end
+				if isTargetToken then entry.isTarget = false end
+			end
+		end
+	end
+
+	if plate then
+		for i = 1, #recentHealRecipients do
+			if recentHealRecipients[i].plate == plate then
+				recentHealRecipients[i].plate = nil
+			end
+		end
+	end
+end
+
+function NameplateSCT:PLAYER_ENTER_COMBAT()
+	autoAttackMelee = true
+end
+
+function NameplateSCT:PLAYER_LEAVE_COMBAT()
+	autoAttackMelee = false
+end
+
+function NameplateSCT:START_AUTOREPEAT_SPELL()
+	autoAttackRanged = true
+end
+
+function NameplateSCT:STOP_AUTOREPEAT_SPELL()
+	autoAttackRanged = false
+end
+
+function NameplateSCT:PLAYER_TARGET_CHANGED()
+	self:ForgetUnitAttribution("target")
+end
+
+function NameplateSCT:PLAYER_REGEN_ENABLED()
+	autoAttackMelee = false
+	autoAttackRanged = false
+end
+
+function NameplateSCT:PLAYER_DEAD()
+	clearAttributionState()
+end
+
+function NameplateSCT:UNIT_SPELLCAST_FAILED(event, unit, castGUID)
+	if unit ~= "player" and unit ~= "pet" then return end
+	if castGUID then
+		pendingCastMeta[castGUID] = nil
+		pendingDamageMeta[castGUID] = nil
+	end
+end
+
 function NameplateSCT:UNIT_SPELLCAST_SENT(event, unit, targetName, castGUID, spellID)
 	if unit ~= "player" and unit ~= "pet" then return end
 	if not spellID or isSecretValue(spellID) then return end
-	if not isHealCapableSpell(spellID) then return end
 	local now = GetTime()
-	pruneExpiredHeals(now)
-	local meta = captureFriendlyCastMeta(targetName)
-	if castGUID then pendingCastMeta[castGUID] = meta end
-	lastSentCast = { spellID = spellID, time = now, meta = meta }
+	pruneExpiredAttribution(now)
+
+	local profile = self.db and self.db.profile
+	local isStrict = (not profile) or (profile.attributionMode ~= "balanced" and profile.attributionMode ~= "all")
+
+	if isHealCapableSpell(spellID) then
+		local meta = captureCastMeta(targetName, true)
+		if castGUID then pendingCastMeta[castGUID] = meta end
+		lastSentCast = { spellID = spellID, time = now, meta = meta }
+	end
+	if isDamageCapableSpell(spellID) then
+		local meta = captureCastMeta(targetName, false)
+		meta.isAoe = isAoeDamageSpell(spellID, meta.rawTargetName or targetName, isStrict)
+		if unit == "pet" then meta.isPetTarget = true end
+		if castGUID then pendingDamageMeta[castGUID] = meta end
+		lastSentDamageCast = { spellID = spellID, time = now, meta = meta }
+	end
 end
 
 function NameplateSCT:UNIT_SPELLCAST_START(event, unit, castGUID, spellID)
 	if unit ~= "player" and unit ~= "pet" then return end
 	if not spellID or isSecretValue(spellID) then return end
-	if not isHealCapableSpell(spellID) then return end
-	if castGUID and not pendingCastMeta[castGUID] then
-		pendingCastMeta[castGUID] = captureFriendlyCastMeta(nil)
+	if isHealCapableSpell(spellID) and castGUID and not pendingCastMeta[castGUID] then
+		pendingCastMeta[castGUID] = captureCastMeta(nil, true)
+	end
+	if isDamageCapableSpell(spellID) and castGUID and not pendingDamageMeta[castGUID] then
+		local meta = captureCastMeta(nil, false)
+		meta.isAoe = AOE_DAMAGE_SPELLS[spellID] == true or GROUND_AOE_DAMAGE_SPELLS[spellID] == true
+		pendingDamageMeta[castGUID] = meta
 	end
 end
 
 function NameplateSCT:UNIT_SPELLCAST_CHANNEL_START(event, unit, castGUID, spellID)
 	if unit ~= "player" and unit ~= "pet" then return end
 	if not spellID or isSecretValue(spellID) then return end
-	if not isHealCapableSpell(spellID) then return end
 	local now = GetTime()
-	pruneExpiredHeals(now)
-	local meta = takeCastMeta(castGUID, spellID, now) or captureFriendlyCastMeta(nil)
-	activeHealChannel = { spellID = spellID, startedAt = now }
-	lastHealCastTime, lastHealSpellID, lastHealPetOnly = now, spellID, (spellID == 136 or unit == "pet")
-	recordHealRecipient(spellID, meta, unit, now)
+	pruneExpiredAttribution(now)
+
+	local profile = self.db and self.db.profile
+	local isStrict = (not profile) or (profile.attributionMode ~= "balanced" and profile.attributionMode ~= "all")
+
+	if isHealCapableSpell(spellID) then
+		local meta = takeCastMeta(pendingCastMeta, lastSentCast, castGUID, spellID, now) or captureCastMeta(nil, true)
+		local isAoeHeal = AOE_HEAL_SPELLS[spellID] == true or (not isStrict and not metaHasPinnedTarget(meta))
+		activeHealChannel = { spellID = spellID, startedAt = now, isAoe = isAoeHeal, meta = meta }
+		lastHealCastTime, lastHealSpellID = now, spellID
+		lastHealPetOnly = (spellID == 136 or unit == "pet")
+		lastHealSelfOnly = SELF_ONLY_HEAL_SPELLS[spellID]
+		lastHealAoe = isAoeHeal
+		lastHealHitsLeft = isAoeHeal and nil or 1
+		lastHealCastMeta = meta
+		recordHealRecipient(spellID, meta, unit, now)
+	end
+	if isDamageCapableSpell(spellID) then
+		local meta = takeCastMeta(pendingDamageMeta, lastSentDamageCast, castGUID, spellID, now)
+			or captureCastMeta(nil, false)
+		local isAoe = (meta and meta.isAoe)
+			or AOE_DAMAGE_SPELLS[spellID] == true
+			or GROUND_AOE_DAMAGE_SPELLS[spellID] == true
+			or (not isStrict and not metaHasPinnedTarget(meta))
+		activeDamageChannel = {
+			spellID = spellID,
+			startedAt = now,
+			isAoe = isAoe,
+			meta = meta,
+		}
+		recordDamageCast(spellID, meta, unit, now)
+	end
 end
 
 function NameplateSCT:UNIT_SPELLCAST_CHANNEL_STOP(event, unit, castGUID, spellID)
 	if unit ~= "player" and unit ~= "pet" then return end
+	local now = GetTime()
 	if activeHealChannel then
-		lastHealCastTime = GetTime()
+		lastHealCastTime = now
 		activeHealChannel = nil
+	end
+	if activeDamageChannel then
+		activeDamageChannel = nil
 	end
 end
 
@@ -2226,44 +2898,98 @@ function NameplateSCT:UNIT_SPELLCAST_SUCCEEDED(event, unit, castGUID, spellID)
 	if not spellID or isSecretValue(spellID) then return end
 	local now = GetTime()
 	attributedSpellID, attributedSpellTime = spellID, now
-	if not isHealCapableSpell(spellID) then return end
+	pruneExpiredAttribution(now)
 
-	pruneExpiredHeals(now)
-	local meta = takeCastMeta(castGUID, spellID, now)
-	lastHealCastTime, lastHealSpellID, lastHealPetOnly = now, spellID, (spellID == 136 or unit == "pet")
-	recordHealRecipient(spellID, meta, unit, now)
+	local profile = self.db and self.db.profile
+	local isStrict = (not profile) or (profile.attributionMode ~= "balanced" and profile.attributionMode ~= "all")
+
+	if isHealCapableSpell(spellID) then
+		local meta = takeCastMeta(pendingCastMeta, lastSentCast, castGUID, spellID, now)
+		local isAoeHeal = AOE_HEAL_SPELLS[spellID] == true
+			or (not isStrict and meta ~= nil and meta.rawTargetName == nil and not metaHasPinnedTarget(meta))
+		lastHealCastTime, lastHealSpellID = now, spellID
+		lastHealPetOnly = (spellID == 136 or unit == "pet")
+		lastHealSelfOnly = SELF_ONLY_HEAL_SPELLS[spellID]
+		lastHealAoe = isAoeHeal
+		lastHealHitsLeft = isAoeHeal and nil or 1
+		lastHealCastMeta = meta
+		recordHealRecipient(spellID, meta, unit, now)
+	end
+	if isDamageCapableSpell(spellID) then
+		local meta = takeCastMeta(pendingDamageMeta, lastSentDamageCast, castGUID, spellID, now)
+		recordDamageCast(spellID, meta, unit, now)
+	end
 end
 
-local function isYourRecentHeal(unit, plate, isPlayer)
-	if not isPlayer and safeUnitCanAttack(unit) then
+---@param unit string
+---@param plate any
+---@param isPlayer boolean?
+---@param onTarget boolean?
+---@param mode string?
+---@return boolean, any
+local function isYourRecentHeal(unit, plate, isPlayer, onTarget, mode)
+	local isPlayerUnit = isPlayer == true
+	local isTargetUnit = onTarget == true
+	if not isPlayerUnit and safeUnitCanAttack(unit) then
 		return false, nil
 	end
+	if mode == "all" then
+		return true, nil
+	end
 
+	local isStrict = (mode ~= "balanced")
 	local now = GetTime()
+	local unitName = (not isPlayerUnit) and safeUnitName(unit) or nil
+	local isPetUnit = (unit == "pet") or select(1, safeUnitIsUnit(unit, "pet")) or false
+
 	if activeHealChannel then
 		local age = now - activeHealChannel.startedAt
 		if age >= 0 and age <= HEAL_CHANNEL_MAX then
-			return true, activeHealChannel.spellID
+			if activeHealChannel.isAoe
+				or (activeHealChannel.meta and unitMatchesMeta(unit, plate, isPlayerUnit, isPetUnit, unitName, isTargetUnit, activeHealChannel.meta))
+				or (not isStrict and not metaHasPinnedTarget(activeHealChannel.meta))
+			then
+				return true, activeHealChannel.spellID
+			end
+		else
+			activeHealChannel = nil
 		end
-		activeHealChannel = nil
 	end
 
 	if lastHealCastTime then
 		local age = now - lastHealCastTime
-		if age >= 0 and age <= HEAL_CAST_WINDOW then
-			if not lastHealPetOnly or unit == "pet" or safeUnitIsUnit(unit, "pet") then
+		local castWindow = isStrict and STRICT_HEAL_CAST_WINDOW or HEAL_CAST_WINDOW
+		if age >= 0 and age <= castWindow and (lastHealHitsLeft == nil or lastHealHitsLeft > 0) then
+			local matched
+			if lastHealPetOnly then
+				matched = isPetUnit
+			elseif lastHealSelfOnly == "self" then
+				matched = isPlayerUnit
+			elseif lastHealSelfOnly == "self_or_pet" then
+				matched = isPlayerUnit or isPetUnit
+			elseif lastHealAoe then
+				matched = true
+			elseif lastHealCastMeta and metaHasPinnedTarget(lastHealCastMeta) then
+				matched = unitMatchesMeta(unit, plate, isPlayerUnit, isPetUnit, unitName, isTargetUnit, lastHealCastMeta)
+			else
+				-- No pinned target was readable (e.g. secret targetName): spend one charge so at
+				-- most one nearby ally's heal is admitted per single-target cast.
+				matched = true
+			end
+			if matched then
+				if lastHealHitsLeft ~= nil then
+					lastHealHitsLeft = lastHealHitsLeft - 1
+				end
 				return true, lastHealSpellID
 			end
 		end
 	end
 
-	local unitName = (not isPlayer) and safeUnitName(unit) or nil
-	local isPetUnit = (unit == "pet") or safeUnitIsUnit(unit, "pet")
 	for i = #recentHealRecipients, 1, -1 do
 		local entry = recentHealRecipients[i]
 		local age = now - (entry.time or 0)
 		if age >= 0 and age <= HEAL_HOT_WINDOW then
-			if (entry.isPlayer and isPlayer)
+			if (entry.isPlayer and isPlayerUnit)
 				or (entry.plate and plate and entry.plate == plate)
 				or (entry.isPet and isPetUnit)
 				or (entry.name and unitName and namesMatch(entry.name, unitName))
@@ -2274,6 +3000,161 @@ local function isYourRecentHeal(unit, plate, isPlayer)
 	end
 
 	return false, nil
+end
+
+---@param unit string
+---@param action string
+---@param flagText string?
+---@param schoolMask any
+---@param plate any
+---@param onTarget boolean?
+---@param isMiss boolean?
+---@param profile table
+---@return boolean isYours, boolean isAutoAttack, any spellID
+local function isYourDamageOrMiss(unit, action, flagText, schoolMask, plate, onTarget, isMiss, profile)
+	local isTargetUnit = onTarget == true
+	local mode = profile and profile.attributionMode or "strict"
+	if safeUnitIsFriend(unit) then
+		return false, false, nil
+	end
+	local canAttack, canAttackKnown = safeUnitAttackable(unit)
+	if canAttackKnown and not canAttack then
+		return false, false, nil
+	end
+
+	local now = GetTime()
+	local unitName = safeUnitName(unit)
+	local allowDots = (not profile) or (profile.attributePlayerDots ~= false)
+	local allowAoe = (not profile) or (profile.attributeAoeCasts ~= false)
+	local allowPet = (not profile) or (profile.attributePetTargets ~= false)
+	local isPetTarget = allowPet and safeUnitExists("pet") and (select(1, safeUnitIsUnit(unit, "pettarget")) == true)
+	local isPhysical = (action == "SWING")
+		or (not schoolMask)
+		or isSecretValue(schoolMask)
+		or (not canaccessvalue(schoolMask))
+		or schoolMask == 0
+		or schoolMask == SCHOOL_MASK_PHYSICAL
+
+	if mode == "all" then
+		local isAuto = (action == "SWING" or action == "RANGE")
+			or (isTargetUnit and isAutoAttacking() and isPhysical)
+		return true, isAuto, nil
+	end
+
+	local isStrict = (mode ~= "balanced")
+
+	-- Priority 1: Targeted offensive ability casts matching this unit (prefer non-auto casts first).
+	if action ~= "SWING" then
+		for i = #pendingDamageCasts, 1, -1 do
+			local entry = pendingDamageCasts[i]
+			local age = now - (entry.time or 0)
+			if not entry.isAoe and not entry.isAutoAttack and (entry.hitsLeft or 0) > 0
+				and (not entry.isPet or allowPet)
+				and age >= 0 and age <= (entry.window or DAMAGE_CAST_WINDOW)
+				and unitMatchesMeta(unit, plate, false, isPetTarget, unitName, isTargetUnit, entry)
+			then
+				entry.hitsLeft = entry.hitsLeft - 1
+				return true, false, entry.spellID
+			end
+		end
+	end
+
+	-- Priority 1b: Explicit auto-repeat casts (Auto Shot 75 / Shoot wand 5019).
+	for i = #pendingDamageCasts, 1, -1 do
+		local entry = pendingDamageCasts[i]
+		local age = now - (entry.time or 0)
+		if entry.isAutoAttack and (entry.hitsLeft or 0) > 0
+			and age >= 0 and age <= (entry.window or 1.5)
+			and unitMatchesMeta(unit, plate, false, isPetTarget, unitName, isTargetUnit, entry)
+		then
+			entry.hitsLeft = entry.hitsLeft - 1
+			return true, true, entry.spellID
+		end
+	end
+
+	-- Priority 2: Active player DoT/debuff ("HARMFUL|PLAYER") like Flame Shock or Serpent Sting.
+	-- Let physical hits on an actively melee-attacked target fall through so white swings stay white.
+	local hasDot = allowDots and hasPlayerAura(unit, "HARMFUL|PLAYER") or false
+	if hasDot and (action == "PERIODIC" or not isPhysical or not isTargetUnit or not isAutoAttacking()) then
+		return true, false, nil
+	end
+
+	-- Priority 3: Active damage channel or recent AoE/ground cast gated by engagement on off-targets.
+	local engaged, engagedKnown = isUnitEngagedWithPlayer(unit)
+	local offTargetAllowed
+	if isStrict then
+		-- Strict mode never guesses when threat cannot be read cleanly: require confirmed
+		-- target, pet target, threat engagement, or your own HARMFUL|PLAYER debuff.
+		offTargetAllowed = isTargetUnit or isPetTarget or (engagedKnown and engaged) or hasDot
+	else
+		offTargetAllowed = isTargetUnit or isPetTarget or (not engagedKnown) or engaged or hasDot
+	end
+
+	if allowAoe and activeDamageChannel then
+		local age = now - activeDamageChannel.startedAt
+		if age >= 0 and age <= DAMAGE_CHANNEL_MAX then
+			if activeDamageChannel.isAoe then
+				if offTargetAllowed then
+					return true, false, activeDamageChannel.spellID
+				end
+			elseif activeDamageChannel.meta and unitMatchesMeta(unit, plate, false, isPetTarget, unitName, isTargetUnit, activeDamageChannel.meta) then
+				return true, false, activeDamageChannel.spellID
+			end
+		else
+			activeDamageChannel = nil
+		end
+	end
+
+	if allowAoe then
+		local defaultAoeWindow = isStrict and STRICT_AOE_CAST_WINDOW or AOE_CAST_WINDOW
+		for i = #pendingDamageCasts, 1, -1 do
+			local entry = pendingDamageCasts[i]
+			local age = now - (entry.time or 0)
+			local capWindow = GROUND_AOE_DAMAGE_SPELLS[entry.spellID] and GROUND_AOE_WINDOW or defaultAoeWindow
+			local window = math.min(entry.window or defaultAoeWindow, capWindow)
+			if entry.isAoe and (entry.hitsLeft or 0) > 0 and age >= 0 and age <= window then
+				if offTargetAllowed then
+					entry.hitsLeft = entry.hitsLeft - 1
+					return true, false, entry.spellID
+				end
+			end
+		end
+	end
+
+	-- Priority 4: Active melee auto-attack or ranged auto-shot on your current target.
+	-- In strict mode, throttle fallback auto-attacks by your swing speed so other players
+	-- hitting the same target cannot flood every swing interval as white numbers.
+	if isTargetUnit and isAutoAttacking() then
+		if isPhysical or action == "SWING" or action == "RANGE" then
+			local swingReady = (not isStrict)
+				or (flagText == "GLANCING")
+				or (lastAutoFallbackAt == 0)
+				or ((now - lastAutoFallbackAt) >= strictSwingGap())
+			if swingReady then
+				lastAutoFallbackAt = now
+				local autoSpell = (autoAttackMelee or safeIsCurrentSpell(AUTO_ATTACK_SPELL_ID))
+					and AUTO_ATTACK_SPELL_ID or AUTO_SHOT_SPELL_ID
+				return true, true, autoSpell
+			end
+		end
+	end
+
+	-- Priority 5: Your pet attacking its current target.
+	if isPetTarget and (isPhysical or isMiss) then
+		local petReady = (not isStrict)
+			or (lastPetFallbackAt == 0)
+			or ((now - lastPetFallbackAt) >= STRICT_PET_SWING_GAP)
+		if petReady then
+			lastPetFallbackAt = now
+			return true, false, nil
+		end
+	end
+
+	if hasDot and isMiss then
+		return true, false, nil
+	end
+
+	return false, false, nil
 end
 
 local function recentAttributedSpell()
@@ -2297,9 +3178,6 @@ local DAMAGE_CATEGORY = {
 	RANGE = "showRangedDamage",
 	PERIODIC = "showPeriodicDamage",
 }
-
--- SWING and WOUND are the auto-attack events, so they get the auto-attack animation pair.
-local AUTO_ATTACK_ACTIONS = { SWING = true, WOUND = true }
 
 --- Draw one heal on the unit that received it. Shared by both combat paths: the text, size,
 --- colour and animation of a heal do not depend on where the event came from.
@@ -2378,15 +3256,18 @@ function NameplateSCT:UNIT_COMBAT(event, unit, action, flagText, amount, schoolM
 
 	-- Resolve the anchor first: nameplate mode needs a plate, screen mode does not.
 	local isPlayer = (unit == "player")
+	local derivedToken = isTargetOfTargetToken(unit)
 	if not isPlayer then
 		-- Damage you take can arrive under an alias that points at you: while a mob is
-		-- hitting you, your target's target is you. Promote it to the player token so the
-		-- "Show damage you take" setting governs it, screen mode puts it on the incoming
-		-- side, and the duplicate collapse uses one bucket.
+		-- hitting you, your target's target is you. Promote it to the player token ONLY when
+		-- confirmed to be the player; otherwise drop derived *target aliases (targettarget,
+		-- focustarget, party1target, ...) instead of assuming who they name.
 		local isSelf, answered = safeUnitIsUnit(unit, "player")
 		if answered and isSelf then
 			isPlayer = true
 			unit = "player"
+		elseif derivedToken then
+			return countDrop("target-of-target is not you")
 		end
 	end
 	-- "Damage you take" gates damage; a heal on you is its own category.
@@ -2398,28 +3279,16 @@ function NameplateSCT:UNIT_COMBAT(event, unit, action, flagText, amount, schoolM
 		return countDrop(isTargetOfTargetToken(unit) and "target-of-target has no plate" or "no nameplate for unit")
 	end
 
-	local matchedHealSpellId
-	if isHeal then
-		local okHeal
-		okHeal, matchedHealSpellId = isYourRecentHeal(unit, plate, isPlayer)
-		if not okHeal then
-			return countDrop("not your heal")
+	local isSecretAmount = isSecretValue(amount)
+	if not isHeal and not isMiss and not isSecretAmount and type(amount) == "number" then
+		local floor = math.max(profile.sizing.hideSmallHitsThreshold or 0, profile.minDamage or 0)
+		if floor > amount then
+			return countDrop("under the damage threshold")
 		end
 	end
 
-	-- Collapse the per-alias repeat of a single hit.
-	local key = plate or (screenMode and ("screen-" .. tostring(unit)) or "player")
-	local now = GetTime()
-	local last = modernLastHit[key]
-	if last and last.action == action and (now - last.time) <= MODERN_DUPLICATE_WINDOW then
-		last.time = now
-		if d then d.duplicates = d.duplicates + 1 end
-		return
-	end
-	modernLastHit[key] = { action = action, time = now }
-
-	-- Target state is best effort: when UnitIsUnit cannot answer we show the text
-	-- anyway rather than hiding every number.
+	-- Target state is best effort: when UnitIsUnit cannot answer we allow the check rather than
+	-- hiding every number.
 	local onTarget, targetKnown = false, false
 	if not isPlayer then
 		onTarget, targetKnown = safeUnitIsUnit(unit, "target")
@@ -2431,6 +3300,37 @@ function NameplateSCT:UNIT_COMBAT(event, unit, action, flagText, amount, schoolM
 	if not isPlayer and targetKnown and not onTarget and not profile.displayOffTargetText then
 		return countDrop("off-target text is off")
 	end
+
+	-- Collapse the per-alias repeat of a hit already accepted for this plate. Checked before
+	-- attribution so an alias does not consume cast charges, and updated only after
+	-- attribution passes so a dropped third-party hit cannot block your own hit right after.
+	local key = plate or (screenMode and ("screen-" .. tostring(unit)) or "player")
+	local now = GetTime()
+	local last = modernLastHit[key]
+	if last and last.action == action and (now - last.time) <= MODERN_DUPLICATE_WINDOW then
+		last.time = now
+		if d then d.duplicates = d.duplicates + 1 end
+		return
+	end
+
+	local matchedHealSpellId
+	local matchedDamageSpellId
+	local isAutoAttack = false
+	if isHeal then
+		local okHeal
+		okHeal, matchedHealSpellId = isYourRecentHeal(unit, plate, isPlayer, onTarget, profile.attributionMode)
+		if not okHeal then
+			return countDrop("not your heal")
+		end
+	elseif not isPlayer then
+		local okDamage
+		okDamage, isAutoAttack, matchedDamageSpellId = isYourDamageOrMiss(unit, action, flagText, schoolMask, plate, onTarget, isMiss, profile)
+		if not okDamage then
+			return countDrop("not your damage")
+		end
+	end
+
+	modernLastHit[key] = { action = action, time = now }
 
 	if isHeal then
 		return self:DrawHeal(unit, amount, crit, matchedHealSpellId or recentAttributedSpell())
@@ -2460,24 +3360,16 @@ function NameplateSCT:UNIT_COMBAT(event, unit, action, flagText, amount, schoolM
 		if d then d.misses = d.misses + 1 end
 		local red, green, blue = hexToRGB(color)
 		self:DisplayText(nil, MISS_EVENT_STRINGS[action] or L["Missed"], size, animation,
-			recentAttributedSpell(), true, nil, unit, red, green, blue)
+			matchedDamageSpellId or recentAttributedSpell(), true, nil, unit, red, green, blue)
 		return
 	end
 
 	-- A hit. Threshold filtering and the small-hit modifiers are numeric comparisons that a
 	-- secret amount cannot survive, so with a secret amount the raw value goes straight to
 	-- the FontString and the numeric modifiers are skipped.
-	local isSecretAmount = isSecretValue(amount)
 	if isSecretAmount and d then d.secret = d.secret + 1 end
 
-	if not isSecretAmount and type(amount) == "number" then
-		local floor = math.max(profile.sizing.hideSmallHitsThreshold or 0, profile.minDamage or 0)
-		if floor > amount then
-			return countDrop("under the damage threshold")
-		end
-	end
-
-	local autoattack = AUTO_ATTACK_ACTIONS[action] == true
+	local autoattack = (not isPlayer) and isAutoAttack
 	local animation
 	if isPlayer then
 		animation = (crit and profile.animationsPersonal.crit) or profile.animationsPersonal.normal
@@ -2507,8 +3399,9 @@ function NameplateSCT:UNIT_COMBAT(event, unit, action, flagText, amount, schoolM
 		text = tostring(amount)
 	end
 
-	local red, green, blue = self:GetTextColor(isPlayer, schoolMask, nil, crit)
-	self:DisplayText(nil, text, size, animation, recentAttributedSpell(), crit, nil, unit, red, green, blue)
+	local colorSpellName = autoattack and "melee" or nil
+	local red, green, blue = self:GetTextColor(isPlayer, schoolMask, colorSpellName, crit)
+	self:DisplayText(nil, text, size, animation, matchedDamageSpellId or recentAttributedSpell(), crit, nil, unit, red, green, blue)
 end
 
 -------------
@@ -3020,18 +3913,18 @@ function NameplateSCT:ColorText(startingText, guid, pGUID, school, spellName, cr
 	if guid ~= (pGUID or playerGUID) then
 		if crit and self.db.profile.useCritColor then
 			finalText = "|Cff" .. self.db.profile.critColor .. startingText .. "|r"
+		elseif self.db.profile.damageColor and self.db.profile.whiteAutoAttacks ~= false and spellName == "melee" and DAMAGE_TYPE_COLORS[spellName] then
+			finalText = "|Cff" .. DAMAGE_TYPE_COLORS[spellName] .. startingText .. "|r"
 		elseif self.db.profile.damageColor and school and DAMAGE_TYPE_COLORS[school] then
 			finalText = "|Cff" .. DAMAGE_TYPE_COLORS[school] .. startingText .. "|r"
-		elseif self.db.profile.damageColor and spellName == "melee" and DAMAGE_TYPE_COLORS[spellName] then
-			finalText = "|Cff" .. DAMAGE_TYPE_COLORS[spellName] .. startingText .. "|r"
 		else
 			finalText = "|Cff" .. self.db.profile.defaultColor .. startingText .. "|r"
 		end
 	else
-		if self.db.profile.damageColorPersonal and school and DAMAGE_TYPE_COLORS[school] then
-			finalText = "|Cff" .. DAMAGE_TYPE_COLORS[school] .. startingText .. "|r"
-		elseif self.db.profile.damageColorPersonal and spellName == "melee" and DAMAGE_TYPE_COLORS[spellName] then
+		if self.db.profile.damageColorPersonal and self.db.profile.whiteAutoAttacks ~= false and spellName == "melee" and DAMAGE_TYPE_COLORS[spellName] then
 			finalText = "|Cff" .. DAMAGE_TYPE_COLORS[spellName] .. startingText .. "|r"
+		elseif self.db.profile.damageColorPersonal and school and DAMAGE_TYPE_COLORS[school] then
+			finalText = "|Cff" .. DAMAGE_TYPE_COLORS[school] .. startingText .. "|r"
 		else
 			finalText = "|Cff" .. self.db.profile.defaultColorPersonal .. startingText .. "|r"
 		end

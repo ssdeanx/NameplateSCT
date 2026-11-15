@@ -10,6 +10,7 @@ globals = {
     "C_NamePlate",
     "C_Secrets",
     "C_Spell",
+    "C_UnitAuras",
     "CombatLogGetCurrentEventInfo",
     "CreateFrame",
     "GetAddOnMetadata",

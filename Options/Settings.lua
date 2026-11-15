@@ -60,6 +60,13 @@ local CLEU_ONLY = {
 }
 NS.cleuOnlySettings = CLEU_ONLY
 
+local RESTRICTED_ONLY = {
+	attributionMode = true,
+	attributePlayerDots = true,
+	attributeAoeCasts = true,
+	attributePetTargets = true,
+}
+
 local function declareControl(kind, path, setter, extra)
 	local record = { kind = kind, path = path, set = setter, page = buildingPage }
 	if extra then
@@ -152,10 +159,24 @@ local function healCritColor()
 	end
 end
 
+--- Restricted-client attribution controls only apply when CLEU is unavailable.
+local function restrictedOnly()
+	return function() return not hasCombatLog() end
+end
+
+local function restrictedAttributionSub()
+	return function()
+		return (not hasCombatLog()) and GetPath("attributionMode") ~= "all"
+	end
+end
+
 -- A gated row says in its own label why it is not available.
 local function presentLabel(label, path)
 	if CLEU_ONLY[path] and not hasCombatLog() then
 		return label .. "  ·  combat log only"
+	end
+	if RESTRICTED_ONLY[path] and hasCombatLog() then
+		return label .. "  ·  Forever / Midnight only"
 	end
 	return label
 end
@@ -343,6 +364,12 @@ local DISPLAY_MODE_OPTIONS = {
 	{ value = "screen", text = "Screen" },
 }
 
+local ATTRIBUTION_MODE_OPTIONS = {
+	{ value = "strict", text = "Strict (your hits & heals only)" },
+	{ value = "balanced", text = "Balanced (allow untargeted AoE)" },
+	{ value = "all", text = "Everything nearby (all sources)" },
+}
+
 local TRUNCATE_OPTIONS = {
 	{ value = "NONE", text = "Full number" },
 	{ value = "WESTERN", text = "k / M" },
@@ -524,8 +551,9 @@ local function buildDashboard(content)
 					local stopped, reason = NS:GetBlizzardFCTStatus()
 					fct = stopped and "off" or ("on: " .. tostring(reason))
 				end
-				local message = ("NameplateSCT %s | %s | mode=%s | source=%s | events=%d drawn=%d dropped=%d | secret=%d refused=%d | pool=%d/%d | fct=%s | fctvars=%d/%d")
+				local message = ("NameplateSCT %s | %s | mode=%s | filter=%s | source=%s | events=%d drawn=%d dropped=%d | secret=%d refused=%d | pool=%d/%d | fct=%s | fctvars=%d/%d")
 					:format(addonVersion(), clientLabel(), tostring(GetPath("displayMode")),
+						tostring(GetPath("attributionMode")),
 						tostring(d.path or "?"), d.events or 0, d.drawn or 0, droppedTotal(),
 						d.secret or 0, d.refused or 0, active, pools, fct, stillOn, steered)
 				if NS.Print then NS:Print(message) end
@@ -705,7 +733,7 @@ local function buildDashboard(content)
 
 	local rightColumn = CreateFrame("Frame", nil, content)
 	rightColumn:SetPoint("TOPLEFT", content, "TOPLEFT", columnWidth + 16, columnTop)
-	rightColumn:SetSize(columnWidth, 200)
+	rightColumn:SetSize(columnWidth, 244)
 
 	local rightY = section(rightColumn, 0, "QUICK SETTINGS")
 	rightY = toggle(rightColumn, rightY, "Addon enabled", "enabled", "Turns all numbers on or off",
@@ -716,6 +744,8 @@ local function buildDashboard(content)
 		NS:RefreshScreenAnchors()
 		NS:ApplyBlizzardFCT()
 	end)
+	rightY = select(rightColumn, rightY, "Combat filter", "attributionMode", ATTRIBUTION_MODE_OPTIONS,
+		nil, restrictedOnly())
 	rightY = toggle(rightColumn, rightY, "Hide Blizzard's own numbers", "hideBlizzardFCT",
 		"Turns off all of Blizzard's own floating combat text, healing included: this client has no per-category switch. Untick, or disable the addon, to hand your settings back",
 		function() NS:ApplyBlizzardFCT() end)
@@ -816,6 +846,20 @@ local function buildGeneral(content)
 	y = toggle(content, y, "Only damage you deal or take", "personalOnly",
 		"Ignores damage other players do to your target", nil, usable("personalOnly"))
 	y = toggle(content, y, "Show misses and avoidance", "showMisses")
+
+	y = section(content, y, "PLAYER ATTRIBUTION")
+
+	y = select(content, y, "Damage & heal filter", "attributionMode", ATTRIBUTION_MODE_OPTIONS,
+		nil, restrictedOnly())
+	y = toggle(content, y, "Include your DoTs on off-targets", "attributePlayerDots",
+		"Tracks Flame Shock, Serpent Sting, and other HARMFUL|PLAYER debuffs on non-target nameplates",
+		nil, restrictedAttributionSub())
+	y = toggle(content, y, "Include AoE on engaged mobs", "attributeAoeCasts",
+		"Allows your AoE and ground spells to hit enemies you have threat on",
+		nil, restrictedAttributionSub())
+	y = toggle(content, y, "Include your pet's target", "attributePetTargets",
+		"Attributes physical hits and misses on your pet's current target",
+		nil, restrictedAttributionSub())
 
 	y = section(content, y, "KINDS OF HIT")
 	y = toggle(content, y, "Melee damage", "showMeleeDamage")
@@ -1003,6 +1047,8 @@ local function buildAppearance(content)
 	y = section(content, y, "COLOURS")
 
 	y = toggle(content, y, "Colour damage by school", "damageColor")
+	y = toggle(content, y, "Auto-attacks always white", "whiteAutoAttacks",
+		"Draw melee swings, Auto Shot, and wand shots in white (#FFFFFF); turn off to use yellow physical school colour")
 	y = hexField(content, y, "Normal hit colour (hex)", "defaultColor",
 		function() return not GetPath("damageColor") end)
 	y = toggle(content, y, "Colour damage you take", "damageColorPersonal")

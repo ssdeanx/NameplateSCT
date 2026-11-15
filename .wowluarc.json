@@ -29,7 +29,22 @@
             "SCHOOL_MASK_SHADOW",
             "SCHOOL_MASK_ARCANE"
         ],
-        "allowBindingGlobals": true
+        "allowBindingGlobals": true,
+        "allowSlashCommands": true
+    },
+    "inference": {
+        "backwardParamTypes": true,
+        "correlatedReturnOverloads": true,
+        "implicitProtectedPrefix": false
+    },
+    "completion": {
+        "callSnippets": true,
+        "snippets": true
+    },
+    "framexml": true,
+    "plugins": [],
+    "editor": {
+        "autoInsertEnd": true
     },
     "hint": {
         "enable": true,

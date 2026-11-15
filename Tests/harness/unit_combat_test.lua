@@ -177,10 +177,31 @@ canaccessvalue = function(value) return value ~= SECRET end
 
 C_Secrets = { HasSecretRestrictions = function() return true end }
 C_CombatLog = { IsCombatLogRestricted = function() return true end }
-local helpfulSpells = { [2061] = true, [774] = true }
+local helpfulSpells = { [2061] = true, [774] = true, [109304] = true, [740] = true, [1243] = true }
+local harmfulSpells = { [133] = true, [19434] = true, [8050] = true, [1978] = true, [2643] = true, [1680] = true, [421] = true }
 C_Spell = {
 	GetSpellTexture = function() return nil end,
 	IsSpellHelpful = function(id) return helpfulSpells[id] == true end,
+	IsSpellHarmful = function(id) return harmfulSpells[id] == true end,
+	IsCurrentSpell = function(id) return _G.__currentSpells and _G.__currentSpells[id] == true or false end,
+}
+
+local function resolveUnit(unit)
+	if unit == "target" and _G.__unitIsTarget then return _G.__unitIsTarget end
+	return unit
+end
+
+C_UnitAuras = {
+	GetUnitAuraInstanceIDs = function(unit, filter)
+		local u = resolveUnit(unit)
+		if filter == "HARMFUL|PLAYER" and _G.__playerHarmfulAuras and _G.__playerHarmfulAuras[u] then
+			return _G.__playerHarmfulAuras[u]
+		end
+		if filter == "HELPFUL|PLAYER" and _G.__playerHelpfulAuras and _G.__playerHelpfulAuras[u] then
+			return _G.__playerHelpfulAuras[u]
+		end
+		return {}
+	end,
 }
 
 -- Nameplate anchors: a hit on "nameplate1" resolves to this frame.
@@ -230,20 +251,46 @@ function UnitGUID() return "Player-1-0000" end
 function UnitIsUnit(a, b)
 	if _G.__unitIsTarget and a == _G.__unitIsTarget and b == "target" then return true end
 	if _G.__unitIsSelf and a == _G.__unitIsSelf and b == "player" then return true end
+	if _G.__unitIsPetTarget and a == _G.__unitIsPetTarget and b == "pettarget" then return true end
 	return false
 end
 function UnitIsDead(unit) return false end
 function UnitExists(unit)
 	if _G.__existingUnits then return _G.__existingUnits[unit] == true end
+	if unit == "pet" then return _G.__hasPet == true end
 	return true
 end
 function UnitCanAttack(a, b)
-	if _G.__hostileUnits and a == "player" then return _G.__hostileUnits[b] == true end
+	local targetUnit = resolveUnit(b)
+	if targetUnit == "player" or targetUnit == "pet" then return false end
+	if _G.__hostileUnits and a == "player" then return _G.__hostileUnits[targetUnit] == true end
+	if _G.__friendlyUnits and a == "player" and _G.__friendlyUnits[targetUnit] then return false end
+	if _G.__unattackableUnits and a == "player" and _G.__unattackableUnits[targetUnit] then return false end
+	return true
+end
+function UnitIsFriend(a, b)
+	local targetUnit = resolveUnit(b)
+	if targetUnit == "player" or targetUnit == "pet" then return true end
+	if _G.__hostileUnits and a == "player" and _G.__hostileUnits[targetUnit] then return false end
+	if _G.__friendlyUnits and a == "player" then return _G.__friendlyUnits[targetUnit] == true end
 	return false
 end
-function UnitName(unit)
-	if _G.__unitNames then return _G.__unitNames[unit] end
+function UnitThreatSituation(a, b)
+	if _G.__secretThreat then return SECRET end
+	local targetUnit = resolveUnit(b)
+	if a == "player" and _G.__unitThreat then return _G.__unitThreat[targetUnit] end
 	return nil
+end
+function UnitName(unit)
+	local targetUnit = resolveUnit(unit)
+	if _G.__unitNames then return _G.__unitNames[targetUnit] end
+	return nil
+end
+function UnitAttackSpeed(unit)
+	if unit == "player" then
+		return _G.__playerAttackSpeed or 2.0, _G.__playerOffhandSpeed
+	end
+	return nil, nil
 end
 -- CVars are a table now: the Blizzard combat-text family is steered, restored and checked by
 -- name, so a single stubbed answer cannot prove any of it.
@@ -457,6 +504,22 @@ end
 
 plateFrames["nameplate1"] = CreateFrame("Frame", "Plate1")
 
+local castSeq = 0
+local function castAt(unit, spellID, targetName)
+	castSeq = castSeq + 1
+	local guid = "cast-auto-" .. castSeq
+	local savedTargetPlate = plateFrames.target
+	local savedUnitIsTarget = _G.__unitIsTarget
+	if unit and unit ~= "target" then
+		plateFrames.target = plateFrames[unit]
+		_G.__unitIsTarget = unit
+	end
+	FireCastEvent("UNIT_SPELLCAST_SENT", "player", targetName or "TargetMob", guid, spellID or 133)
+	FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", guid, spellID or 133)
+	plateFrames.target = savedTargetPlate
+	_G.__unitIsTarget = savedUnitIsTarget
+end
+
 --------------------------------------------------------------------------------
 -- A plain hit must render
 --------------------------------------------------------------------------------
@@ -466,6 +529,7 @@ createdFontStrings = {}
 NS.diagnostics.drawn = 0
 NS.diagnostics.events = 0
 
+castAt("nameplate1", 133)
 FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 1234, SCHOOL_MASK_FIRE)
 
 ok(NS.diagnostics.events == 1, "one event counted")
@@ -493,6 +557,7 @@ ok(type(coloured) == "table" and type(coloured[1]) == "number" and type(coloured
 NS.db.profile.truncateMethod = "NONE"
 _G.__now = 150
 createdFontStrings = {}
+castAt("nameplate1", 133)
 FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 1234, SCHOOL_MASK_FIRE)
 local fullText
 for _, fs in ipairs(createdFontStrings) do
@@ -514,6 +579,7 @@ eq(NS.diagnostics.drawn, 0, "the same hit on an alias plate is not drawn twice")
 
 -- A genuinely later hit still draws.
 _G.__now = 100.5
+castAt("nameplate1", 133)
 FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 4321, SCHOOL_MASK_FIRE)
 eq(NS.diagnostics.drawn, 1, "a later hit draws again")
 
@@ -524,6 +590,7 @@ eq(NS.diagnostics.drawn, 1, "a later hit draws again")
 NS.diagnostics.drawn = 0
 _G.__now = 200
 createdFontStrings = {}
+castAt("nameplate1", 133)
 FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", SECRET, SCHOOL_MASK_SHADOW)
 
 eq(NS.diagnostics.drawn, 1, "a secret amount still draws")
@@ -540,6 +607,7 @@ ok(passedThrough, "the secret value reaches FontString:SetText by identity, neve
 NS.diagnostics.drawn = 0
 _G.__now = 300
 createdFontStrings = {}
+castAt("nameplate1", 19434)
 FireEvent("UNIT_COMBAT", "nameplate1", "DODGE", "", 0, 0)
 
 local missText
@@ -553,7 +621,8 @@ ok(missText ~= nil and missText:find("Dodged") ~= nil, "a dodge renders as text"
 --------------------------------------------------------------------------------
 
 NS.db.profile.showHealing = true
-NS:ClearHealAttribution()
+_G.__friendlyUnits = { nameplate1 = true, nameplate2 = true }
+NS:ClearAttribution()
 NS.diagnostics.drawn = 0
 createdFontStrings = {}
 _G.__now = 400
@@ -649,7 +718,8 @@ NS:CombatFilter(0, "SPELL_HEAL", false, UnitGUID("player"), "Me", 0, 0,
 eq(NS.diagnostics.drawn, 1, "CLEU draws heals you cast on yourself")
 NS.db.profile.personal = personalBefore
 plateFrames["nameplate2"] = nil
-NS:ClearHealAttribution()
+_G.__friendlyUnits = nil
+NS:ClearAttribution()
 
 -- And it can be switched off entirely.
 NS.db.profile.showHealing = false
@@ -680,12 +750,14 @@ for _, case in ipairs(categories) do
 	NS.db.profile[case.key] = false
 	NS.diagnostics.drawn = 0
 	_G.__now = _G.__now + 1
+	castAt("nameplate1", 133)
 	FireEvent("UNIT_COMBAT", "nameplate1", case.action, "", 100, SCHOOL_MASK_FIRE)
 	eq(NS.diagnostics.drawn, 0, case.action .. " is off when " .. case.key .. " is off")
 	eq(NS.diagnostics.lastDrop, "that kind of damage is off", "the drop reason names the category")
 
 	NS.db.profile[case.key] = true
 	_G.__now = _G.__now + 1
+	castAt("nameplate1", 133)
 	FireEvent("UNIT_COMBAT", "nameplate1", case.action, "", 100, SCHOOL_MASK_FIRE)
 	eq(NS.diagnostics.drawn, 1, case.action .. " draws again when " .. case.key .. " is on")
 	NS.db.profile[case.key] = saved
@@ -725,6 +797,7 @@ NS.db.profile.sizing.crits = true
 NS.db.profile.sizing.critsScale = 2
 _G.__now = _G.__now + 1
 createdFontStrings = {}
+castAt("nameplate1", 133)
 FireEvent("UNIT_COMBAT", "nameplate1", "SPELL", "CRITICAL", 200, SCHOOL_MASK_FIRE)
 local critFontString = _G.__lastNumberFontString
 ok(critFontString ~= nil, "a crit draws")
@@ -742,6 +815,7 @@ ok(critFontString and critFontString._textColor and critFontString._textColor[1]
 NS.db.profile.animations.ability = "rainfall"
 _G.__now = _G.__now + 1
 createdFontStrings = {}
+castAt("nameplate1", 133)
 FireEvent("UNIT_COMBAT", "nameplate1", "SPELL", "", 200, SCHOOL_MASK_FIRE)
 local plainFontString = _G.__lastNumberFontString
 eq(plainFontString and plainFontString.animation, "rainfall", "a normal hit uses the normal animation")
@@ -749,7 +823,8 @@ ok(plainFontString and plainFontString._textColor
 	and (plainFontString._textColor[1] ~= critFontString._textColor[1]
 		or plainFontString._textColor[3] ~= critFontString._textColor[3]),
 	"a normal hit is not coloured like a crit")
-NS.db.profile.useCritColor = false
+NS.db.profile.useCritColor = true
+NS.db.profile.critColor = "ffff00"
 NS.db.profile.sizing.critsScale = 1.5
 
 --------------------------------------------------------------------------------
@@ -816,9 +891,12 @@ NS.db.profile.displayMode = "screen"
 _G.__now = 551
 NS.diagnostics.drawn = 0
 createdFontStrings = {}
+_G.__playerHarmfulAuras = { targettarget = { 101 } }
 local screenOk, screenErr = pcall(FireEvent, "UNIT_COMBAT", "targettarget", "WOUND", "", 901, SCHOOL_MASK_FIRE)
+_G.__playerHarmfulAuras = nil
 ok(screenOk, "a target-of-target hit does not raise in screen mode", screenErr)
-eq(NS.diagnostics.drawn, 1, "screen mode still draws a target-of-target hit")
+eq(NS.diagnostics.drawn, 0, "screen mode drops unconfirmed target-of-target (not assumed to be you)")
+eq(NS.diagnostics.lastDrop, "target-of-target is not you", "dropped target-of-target records the reason")
 NS.db.profile.displayMode = "nameplates"
 
 -- A plain "target" token is valid and must keep resolving.
@@ -929,6 +1007,7 @@ NS.db.profile.showMisses = true
 NS.diagnostics.drawn = 0
 _G.__now = 600
 createdFontStrings = {}
+castAt("nameplate1", 133)
 local screenDrawn = FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 777, SCHOOL_MASK_FIRE)
 ok(screenDrawn, "unit-combat event dispatched")
 eq(NS.diagnostics.drawn, 1, "screen mode draws without a nameplate frame")
@@ -941,10 +1020,12 @@ NS.db.profile.displayMode = "nameplates"
 NS.db.profile.minDamage = 1000
 NS.diagnostics.drawn = 0
 _G.__now = 700
+castAt("nameplate1", 133)
 FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 500, SCHOOL_MASK_FIRE)
 eq(NS.diagnostics.drawn, 0, "a hit under the minimum damage floor is dropped")
 
 _G.__now = 700.5
+castAt("nameplate1", 133)
 FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 1500, SCHOOL_MASK_FIRE)
 eq(NS.diagnostics.drawn, 1, "a hit above the floor draws")
 NS.db.profile.minDamage = 0
@@ -953,11 +1034,13 @@ NS.db.profile.minDamage = 0
 NS.db.profile.showMisses = false
 NS.diagnostics.drawn = 0
 _G.__now = 800
+castAt("nameplate1", 19434)
 FireEvent("UNIT_COMBAT", "nameplate1", "DODGE", "", 0, 0)
 eq(NS.diagnostics.drawn, 0, "misses are suppressed when the toggle is off")
 NS.db.profile.showMisses = true
 
 _G.__now = 801
+castAt("nameplate1", 19434)
 FireEvent("UNIT_COMBAT", "nameplate1", "DODGE", "", 0, 0)
 eq(NS.diagnostics.drawn, 1, "misses draw again when the toggle is on")
 
@@ -1150,6 +1233,7 @@ NS.db.profile.displayMode = "nameplates"
 NS.diagnostics.drawn = 0
 _G.__now = 900
 createdFontStrings = {}
+castAt("nameplate1", 133)
 FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 500, SCHOOL_MASK_FIRE)
 
 local cachedFontString
@@ -1188,6 +1272,7 @@ _G.__lastFontString = nil
 _G.__lastNumberFontString = nil
 _G.__now = 1000
 NS.diagnostics.drawn = 0
+castAt("nameplate1", 133)
 FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 640, SCHOOL_MASK_FIRE)
 
 -- Font strings are pooled, so look at the one that was actually written to. The shadow is a
@@ -1491,6 +1576,7 @@ NS.db.profile.formatting.size = 20
 
 _G.__now = 1300
 createdFontStrings = {}
+castAt("nameplate1", 133)
 FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 800, SCHOOL_MASK_FIRE)
 local shadowMain = _G.__lastNumberFontString
 local shadowRegion = shadowMain and shadowMain.shadow
@@ -1512,6 +1598,7 @@ end
 -- A secret amount reaches both sinks by identity, never formatted.
 _G.__now = 1301
 createdFontStrings = {}
+castAt("nameplate1", 133)
 FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", SECRET, SCHOOL_MASK_SHADOW)
 local secretMain = _G.__lastNumberFontString
 ok(secretMain and secretMain.shadow and secretMain.shadow._text == SECRET,
@@ -1521,6 +1608,7 @@ ok(secretMain and secretMain.shadow and secretMain.shadow._text == SECRET,
 NS.db.profile.textShadow = false
 _G.__now = 1302
 createdFontStrings = {}
+castAt("nameplate1", 133)
 FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 810, SCHOOL_MASK_FIRE)
 local unshadowed = _G.__lastNumberFontString
 ok(unshadowed and unshadowed.shadow and unshadowed.shadow._alpha == 0,
@@ -1531,6 +1619,7 @@ eq(unshadowed._shadowOffset[1], 0, "the native shadow stays off when the custom 
 NS.db.profile.textShadow = true
 _G.__now = 1310
 createdFontStrings = {}
+castAt("nameplate1", 133)
 FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 820, SCHOOL_MASK_FIRE)
 local fading = _G.__lastNumberFontString
 _G.__now = 1310.5
@@ -1554,6 +1643,7 @@ NS.db.profile.offTargetFormatting.alpha = 0.3
 
 plateFrames["nameplate2"] = CreateFrame("Frame", "Plate2")
 _G.__unitIsTarget = "nameplate1"
+_G.__playerHarmfulAuras = { nameplate1 = { 101 }, nameplate2 = { 102 } }
 
 _G.__now = 1400
 createdFontStrings = {}
@@ -1581,6 +1671,7 @@ NS.diagnostics.drawn = 0
 FireEvent("UNIT_COMBAT", "nameplate2", "WOUND", "", 902, SCHOOL_MASK_FIRE)
 eq(NS.diagnostics.drawn, 0, "off-target text can be switched off completely")
 NS.db.profile.displayOffTargetText = true
+_G.__playerHarmfulAuras = nil
 _G.__unitIsTarget = nil
 
 -- An unknown font falls back to the client's own default, which is right on every locale.
@@ -2083,6 +2174,327 @@ for _, control in ipairs(NS.settingsControls or {}) do
 end
 ok(#wronglyDisabled == 0, "settings that do apply on this client stay enabled",
 	#wronglyDisabled > 0 and table.concat(wronglyDisabled, ", ") or nil)
+
+--------------------------------------------------------------------------------
+-- Player-only damage/miss attribution, Flame Shock / Serpent Sting off-target DoTs,
+-- tightened heals, and default colors (white swings, yellow abilities & crits)
+--------------------------------------------------------------------------------
+
+NS:ClearAttribution()
+NS.db.profile.displayMode = "nameplates"
+NS.db.profile.displayOffTargetText = true
+NS.db.profile.showMisses = true
+NS.db.profile.showHealing = true
+NS.db.profile.damageColor = true
+NS.db.profile.useCritColor = true
+NS.db.profile.critColor = "ffff00"
+NS.db.profile.animations.autoattack = "verticalUp"
+NS.db.profile.animations.ability = "verticalUp"
+NS.db.profile.animations.crit = "verticalUp"
+NS.db.profile.animations.autoattackcrit = "verticalUp"
+
+plateFrames["nameplate1"] = CreateFrame("Frame", "PlateAttr1")
+plateFrames["nameplate2"] = CreateFrame("Frame", "PlateAttr2")
+plateFrames["nameplate3"] = CreateFrame("Frame", "PlateAttr3")
+
+-- 1. Third-party damage on an off-target nameplate must never draw.
+_G.__now = 2000
+_G.__unitIsTarget = "nameplate1"
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "WOUND", "", 500, SCHOOL_MASK_FIRE)
+eq(NS.diagnostics.drawn, 0, "another player's off-target hit is dropped")
+eq(NS.diagnostics.lastDrop, "not your damage", "dropped third-party hit records the reason")
+
+-- 2. Third-party hit in a dungeon pack you have threat on still drops without DoT or cast.
+_G.__now = 2001
+_G.__unitThreat = { nameplate2 = 1 }
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "WOUND", "", 500, SCHOOL_MASK_FROST)
+eq(NS.diagnostics.drawn, 0, "another player's hit on a pack mob with no DoT or cast is dropped")
+_G.__unitThreat = nil
+
+-- 3. Targeting someone else's mob without attacking, casting or DoTs also drops their hits.
+_G.__now = 2002
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 500, SCHOOL_MASK_PHYSICAL)
+eq(NS.diagnostics.drawn, 0, "another player's hit on your unattacked target is dropped")
+
+-- 4. Damage taken by friendly units (e.g. tank or party member) never shows as your damage.
+_G.__now = 2003
+_G.__friendlyUnits = { nameplate2 = true }
+_G.__unitThreat = { nameplate2 = 1 }
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "WOUND", "", 500, SCHOOL_MASK_PHYSICAL)
+eq(NS.diagnostics.drawn, 0, "friendly unit taking damage is dropped")
+_G.__friendlyUnits = nil
+_G.__unitThreat = nil
+
+-- 5. Active player DoTs/debuffs (Flame Shock / Serpent Sting via HARMFUL|PLAYER) draw off-target.
+_G.__now = 2004
+_G.__playerHarmfulAuras = { nameplate2 = { 8050 } }
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "WOUND", "", 220, SCHOOL_MASK_FIRE)
+eq(NS.diagnostics.drawn, 1, "Flame Shock / Serpent Sting off-target tick draws via HARMFUL|PLAYER")
+_G.__now = 2005
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "PERIODIC", "", 225, SCHOOL_MASK_NATURE)
+eq(NS.diagnostics.drawn, 1, "off-target PERIODIC tick also draws via HARMFUL|PLAYER")
+_G.__playerHarmfulAuras = nil
+
+-- 6. AoE casts (Whirlwind 1680) hit engaged mobs on off-targets, never unengaged nearby mobs.
+_G.__now = 2006
+_G.__unitThreat = { nameplate2 = 1 } -- nameplate3 is unengaged (nil threat)
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", nil, "cast-ww-1", 1680)
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-ww-1", 1680)
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate3", "WOUND", "", 400, SCHOOL_MASK_PHYSICAL)
+eq(NS.diagnostics.drawn, 0, "AoE cast drops hits on unengaged off-target mobs")
+FireEvent("UNIT_COMBAT", "nameplate2", "WOUND", "", 400, SCHOOL_MASK_PHYSICAL)
+eq(NS.diagnostics.drawn, 1, "AoE cast draws hits on engaged off-target mobs")
+_G.__unitThreat = nil
+NS:ClearAttribution()
+
+-- 7. Changing target or removing a nameplate invalidates stale single-target cast attribution.
+_G.__now = 2007
+_G.__unitIsTarget = "nameplate1"
+plateFrames.target = plateFrames["nameplate1"]
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", "OldMob", "cast-stale-1", 133)
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-stale-1", 133)
+_G.__unitIsTarget = "nameplate3"
+plateFrames.target = plateFrames["nameplate3"]
+FireEvent("PLAYER_TARGET_CHANGED")
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate3", "WOUND", "", 600, SCHOOL_MASK_FIRE)
+eq(NS.diagnostics.drawn, 0, "changing target drops stale casts from hitting the new target")
+NS:ClearAttribution()
+
+-- 8. Default colors: swings = white, physical abilities = yellow, crits = yellow.
+eq(NS.defaults.profile.useCritColor, true, "useCritColor defaults to true for yellow crits")
+eq(NS.defaults.profile.critColor, "ffff00", "critColor defaults to yellow (ffff00)")
+
+_G.__now = 2010
+_G.__unitIsTarget = "nameplate1"
+plateFrames.target = plateFrames["nameplate1"]
+FireEvent("PLAYER_ENTER_COMBAT")
+
+createdFontStrings = {}
+FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 150, SCHOOL_MASK_PHYSICAL)
+local swingFS = _G.__lastNumberFontString
+ok(swingFS and swingFS._textColor
+	and swingFS._textColor[1] > 0.99 and swingFS._textColor[2] > 0.99 and swingFS._textColor[3] > 0.99,
+	"default melee swing is white (#FFFFFF)")
+
+_G.__now = 2011
+createdFontStrings = {}
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", "TargetMob", "cast-aimed-1", 19434)
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-aimed-1", 19434)
+FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 750, SCHOOL_MASK_PHYSICAL)
+local abilityFS = _G.__lastNumberFontString
+ok(abilityFS and abilityFS._textColor
+	and abilityFS._textColor[1] > 0.99 and abilityFS._textColor[2] > 0.99 and abilityFS._textColor[3] < 0.01,
+	"physical ability hit is yellow (#FFFF00)")
+
+_G.__now = 2012
+createdFontStrings = {}
+FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "CRITICAL", 320, SCHOOL_MASK_PHYSICAL)
+local swingCritFS = _G.__lastNumberFontString
+ok(swingCritFS and swingCritFS._textColor
+	and swingCritFS._textColor[1] > 0.99 and swingCritFS._textColor[2] > 0.99 and swingCritFS._textColor[3] < 0.01,
+	"melee swing crit is yellow (#FFFF00)")
+
+_G.__now = 2013
+createdFontStrings = {}
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", "TargetMob", "cast-firecrit-1", 133)
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-firecrit-1", 133)
+FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "CRITICAL", 1100, SCHOOL_MASK_FIRE)
+local spellCritFS = _G.__lastNumberFontString
+ok(spellCritFS and spellCritFS._textColor
+	and spellCritFS._textColor[1] > 0.99 and spellCritFS._textColor[2] > 0.99 and spellCritFS._textColor[3] < 0.01,
+	"spell ability crit is yellow (#FFFF00)")
+
+FireEvent("PLAYER_LEAVE_COMBAT")
+
+-- Auto Shot (75): normal white, crit yellow.
+_G.__now = 2014
+createdFontStrings = {}
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", "TargetMob", "cast-autoshot-1", 75)
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-autoshot-1", 75)
+FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 210, SCHOOL_MASK_PHYSICAL)
+local autoShotFS = _G.__lastNumberFontString
+ok(autoShotFS and autoShotFS._textColor
+	and autoShotFS._textColor[1] > 0.99 and autoShotFS._textColor[2] > 0.99 and autoShotFS._textColor[3] > 0.99,
+	"Auto Shot normal hit is white (#FFFFFF)")
+
+-- 9. Tightened heals: pinned Flash Heal & self-only Exhilaration do not leak off-target heals.
+_G.__friendlyUnits = { nameplate1 = true, nameplate2 = true }
+_G.__unitNames = { nameplate1 = "Tank", nameplate2 = "OtherAlly" }
+_G.__unitIsTarget = "nameplate1"
+plateFrames.target = plateFrames["nameplate1"]
+NS:ClearAttribution()
+
+_G.__now = 2020
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", "Tank", "cast-fh-1", 2061)
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-fh-1", 2061)
+_G.__now = 2020.2
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "HEAL", "", 500, 0)
+eq(NS.diagnostics.drawn, 0, "another healer's heal on an un-targeted ally is dropped inside 2s window")
+FireEvent("UNIT_COMBAT", "nameplate1", "HEAL", "", 500, 0)
+eq(NS.diagnostics.drawn, 1, "your Flash Heal draws on the pinned recipient")
+
+-- 10. Direct single-target Flash Heal must not keep Tank open for other healers 4s later,
+-- and buff casts (Fortitude 1243) must never open a healing window.
+_G.__now = 2024.0
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate1", "HEAL", "", 650, 0)
+eq(NS.diagnostics.drawn, 0, "another healer's direct heal on Tank 4s after your Flash Heal is dropped")
+
+_G.__now = 2026
+NS:ClearAttribution()
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", "Tank", "cast-fort-1", 1243)
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-fort-1", 1243)
+_G.__now = 2026.2
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate1", "HEAL", "", 700, 0)
+eq(NS.diagnostics.drawn, 0, "casting Power Word: Fortitude does not authorize other healers' heals")
+
+-- 11. Unpinned secret-target Flash Heal allows at most one hit charge, never a raid flood.
+_G.__now = 2028
+NS:ClearAttribution()
+_G.__unitIsTarget = nil
+plateFrames.target = nil
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", SECRET, "cast-fh-sec", 2061)
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-fh-sec", 2061)
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate1", "HEAL", "", 550, 0)
+FireEvent("UNIT_COMBAT", "nameplate2", "HEAL", "", 550, 0)
+eq(NS.diagnostics.drawn, 1, "single-target secret heal admits at most one hit and drops subsequent raid heals")
+
+-- 12. Utility casts (non-harmful) must never open a damage/AoE window, and strict mode
+-- drops off-target AoE when threat is secret/unreadable.
+_G.__friendlyUnits = nil
+_G.__unitNames = nil
+NS:ClearAttribution()
+NS.db.profile.attributionMode = "strict"
+_G.__now = 2030
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", nil, "cast-util-1", 99999)
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-util-1", 99999)
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "WOUND", "", 300, SCHOOL_MASK_PHYSICAL)
+eq(NS.diagnostics.drawn, 0, "utility cast does not open a damage/AoE attribution window")
+
+_G.__now = 2032
+_G.__secretThreat = true
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", nil, "cast-ww-sec", 1680)
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-ww-sec", 1680)
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "WOUND", "", 400, SCHOOL_MASK_PHYSICAL)
+eq(NS.diagnostics.drawn, 0, "strict mode drops off-target AoE when threat cannot be read (secret)")
+_G.__secretThreat = nil
+
+-- 13. Strict auto-attack swing gating blocks rapid third-party melee spam on your target.
+NS:ClearAttribution()
+_G.__playerAttackSpeed = 2.0
+_G.__unitIsTarget = "nameplate1"
+plateFrames.target = plateFrames["nameplate1"]
+FireEvent("PLAYER_ENTER_COMBAT")
+_G.__now = 2040.0
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 150, SCHOOL_MASK_PHYSICAL)
+eq(NS.diagnostics.drawn, 1, "your first white melee swing draws on target")
+_G.__now = 2040.3
+FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 180, SCHOOL_MASK_PHYSICAL)
+eq(NS.diagnostics.drawn, 1, "another melee player's hit 0.3s into your 2.0s swing timer is dropped")
+_G.__now = 2041.4
+FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 160, SCHOOL_MASK_PHYSICAL)
+eq(NS.diagnostics.drawn, 2, "your next melee swing after the weapon swing interval draws cleanly")
+FireEvent("PLAYER_LEAVE_COMBAT")
+_G.__playerAttackSpeed = nil
+
+-- 14. New dashboard/settings controls: whiteAutoAttacks, attributePlayerDots, attributeAoeCasts, attributionMode.
+NS:ClearAttribution()
+_G.__now = 2050
+FireEvent("PLAYER_ENTER_COMBAT")
+NS.db.profile.whiteAutoAttacks = false
+createdFontStrings = {}
+FireEvent("UNIT_COMBAT", "nameplate1", "WOUND", "", 155, SCHOOL_MASK_PHYSICAL)
+local yellowSwingFS = _G.__lastNumberFontString
+ok(yellowSwingFS and yellowSwingFS._textColor
+	and yellowSwingFS._textColor[1] > 0.99 and yellowSwingFS._textColor[2] > 0.99 and yellowSwingFS._textColor[3] < 0.01,
+	"turning whiteAutoAttacks off uses yellow physical colour for swings")
+NS.db.profile.whiteAutoAttacks = true
+FireEvent("PLAYER_LEAVE_COMBAT")
+
+_G.__playerHarmfulAuras = { nameplate2 = { 8050 } }
+NS.db.profile.attributePlayerDots = false
+_G.__now = 2055
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "PERIODIC", "", 220, SCHOOL_MASK_FIRE)
+eq(NS.diagnostics.drawn, 0, "turning off attributePlayerDots suppresses off-target HARMFUL|PLAYER DoTs")
+NS.db.profile.attributePlayerDots = true
+_G.__now = 2056
+FireEvent("UNIT_COMBAT", "nameplate2", "PERIODIC", "", 220, SCHOOL_MASK_FIRE)
+eq(NS.diagnostics.drawn, 1, "re-enabling attributePlayerDots restores off-target DoTs")
+_G.__playerHarmfulAuras = nil
+
+NS.db.profile.attributionMode = "all"
+_G.__now = 2060
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "WOUND", "", 500, SCHOOL_MASK_FIRE)
+eq(NS.diagnostics.drawn, 1, "setting attributionMode to 'all' shows all nearby combat hits")
+NS.db.profile.attributionMode = "strict"
+
+-- attributeAoeCasts and attributePetTargets toggles.
+NS:ClearAttribution()
+_G.__unitThreat = { nameplate2 = 1 }
+NS.db.profile.attributeAoeCasts = false
+_G.__now = 2062
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", nil, "cast-ww-off", 1680)
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-ww-off", 1680)
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "WOUND", "", 400, SCHOOL_MASK_PHYSICAL)
+eq(NS.diagnostics.drawn, 0, "turning off attributeAoeCasts drops off-target Whirlwind hits")
+NS.db.profile.attributeAoeCasts = true
+_G.__now = 2063
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", nil, "cast-ww-on", 1680)
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-ww-on", 1680)
+FireEvent("UNIT_COMBAT", "nameplate2", "WOUND", "", 400, SCHOOL_MASK_PHYSICAL)
+eq(NS.diagnostics.drawn, 1, "re-enabling attributeAoeCasts restores off-target Whirlwind hits")
+_G.__unitThreat = nil
+
+NS:ClearAttribution()
+_G.__hasPet = true
+_G.__unitIsPetTarget = "nameplate2"
+NS.db.profile.attributePetTargets = false
+_G.__now = 2064
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "WOUND", "", 110, SCHOOL_MASK_PHYSICAL)
+eq(NS.diagnostics.drawn, 0, "turning off attributePetTargets suppresses pettarget physical hits")
+NS.db.profile.attributePetTargets = true
+_G.__now = 2065
+FireEvent("UNIT_COMBAT", "nameplate2", "WOUND", "", 110, SCHOOL_MASK_PHYSICAL)
+eq(NS.diagnostics.drawn, 1, "re-enabling attributePetTargets restores pettarget physical hits")
+_G.__hasPet = nil
+_G.__unitIsPetTarget = nil
+
+_G.__now = 2070
+NS:ClearAttribution()
+FireCastEvent("UNIT_SPELLCAST_SENT", "player", "Me", "cast-exhil-1", 109304)
+FireCastEvent("UNIT_SPELLCAST_SUCCEEDED", "player", "cast-exhil-1", 109304)
+_G.__now = 2070.1
+NS.diagnostics.drawn = 0
+FireEvent("UNIT_COMBAT", "nameplate2", "HEAL", "", 900, 0)
+eq(NS.diagnostics.drawn, 0, "self-only heal (Exhilaration) never opens off-target heals")
+FireEvent("UNIT_COMBAT", "player", "HEAL", "", 900, 0)
+eq(NS.diagnostics.drawn, 1, "self-only heal draws on player")
+
+_G.__friendlyUnits = nil
+_G.__unitNames = nil
+_G.__unitIsTarget = nil
+plateFrames.target = nil
+plateFrames["nameplate2"] = nil
+plateFrames["nameplate3"] = nil
+NS:ClearAttribution()
 
 --------------------------------------------------------------------------------
 

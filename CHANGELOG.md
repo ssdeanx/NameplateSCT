@@ -1,5 +1,29 @@
 # NameplateSCT
 
+## [1.68] (2026-11-14)
+
+### Hardened player-only attribution (`targettarget`, heals, swings, AoE) & `/nsct` controls
+
+- **Closed `targettarget` / derived token leaks:** In `UNIT_COMBAT`, `"targettarget"` (and other `*target` derived tokens) are promoted to `"player"` ONLY when `UnitIsUnit(unit, "player")` explicitly answers `true`; unverified derived tokens are dropped (`"target-of-target is not you"`) in both nameplate and screen modes so targeting a boss attacking a tank or targeting another player never leaks their hits or heals.
+- **Closed buff/utility & heal window leaks:**
+  - `isDamageCapableSpell` no longer blindly returns `true` for unknown/non-harmful spells (utility casts, buffs, potions), and `recordDamageCast` never fabricates `isTarget = true` when no target existed.
+  - `isHealCapableSpell` excludes non-healing helpful buffs, dispels, blessings, shouts, and resurrections (`NON_HEAL_HELPFUL_SPELLS`). Direct single-target heals carry a 1-hit charge (`lastHealHitsLeft = 1`) instead of letting another healer's direct heals piggyback inside the 2s window, and only HoT/Mend Pet spells (`HOT_HEAL_SPELLS`) extend into the 12s HoT window.
+- **Hardened strict AoE & swing gating:** Default `attributionMode = "strict"` never fails open on off-target AoE when `UnitThreatSituation("player", unit)` is secret/unreadable, and gates Priority-4 auto-attack fallbacks on `"target"` using `UnitAttackSpeed("player")` (and `glancing`) so raid/party melee spam on your target cannot flood as white swings.
+- **Dashboard & Settings integration (`/nsct`):**
+  - Added **Combat filter** (`attributionMode`: `strict`, `balanced`, `all`) to Dashboard **Quick Settings** and **General -> Player Attribution**.
+  - Added **Include your DoTs on off-targets** (`attributePlayerDots`), **Include AoE on engaged mobs** (`attributeAoeCasts`), and **Include your pet's target** (`attributePetTargets`) to **General -> Player Attribution**.
+  - Added **Auto-attacks always white** (`whiteAutoAttacks`, default `true`) to **Appearance -> Colours**, and included active `filter=` in Dashboard **Copy details**.
+
+## [1.67] (2026-11-14)
+
+### Fixed: Only show damage/heals from you, white swings, and yellow abilities & crits
+
+On restricted clients (`UNIT_COMBAT`), off-target nameplates previously drew damage and misses from other players, pinned single-target or self-only heals still left a brief window for other healers' numbers, and auto-attack swings drew yellow instead of white while crits defaulted to non-yellow.
+
+- **Strict player-only damage & miss attribution (`UNIT_COMBAT`):** Damage and misses on hostile nameplates now require positive player ownership—targeted offensive cast attribution (`UNIT_SPELLCAST_SENT`/`START`/`CHANNEL_START`/`SUCCEEDED`), active player DoT/debuff verification via `C_UnitAuras.GetUnitAuraInstanceIDs(unit, "HARMFUL|PLAYER", 1)` (e.g. Flame Shock, Serpent Sting), AoE/channel casts gated by player engagement (`UnitThreatSituation("player", unit)`), active melee auto-attack / Auto Shot on `"target"` (`PLAYER_ENTER_COMBAT`/`PLAYER_LEAVE_COMBAT`, `START_AUTOREPEAT_SPELL`/`STOP_AUTOREPEAT_SPELL`, `C_Spell.IsCurrentSpell`), or `"pettarget"`. Unattributed hits on off-targets or unattacked targets and damage taken by friendly units are dropped (`"not your damage"`), and `PLAYER_TARGET_CHANGED` / `NAME_PLATE_UNIT_REMOVED` clear stale unit attribution.
+- **Tightened heal attribution (`isYourRecentHeal`):** Single-target heals with a captured recipient no longer admit unrelated allies during the 2s cast window, and self-only heals (e.g. Exhilaration, Crimson Vial, Desperate Prayer, Frenzied Regeneration) are restricted to player/pet.
+- **Default colors restored:** Auto-attack swings and Auto Shot now pass `"melee"` to `GetTextColor` and check `"melee"` before `DAMAGE_TYPE_COLORS[school]` so normal swings render white (`#FFFFFF`), physical abilities render yellow (`#FFFF00`), elemental spells use school colors, and `useCritColor` defaults to `true` (`critColor = "ffff00"`) so crits render yellow (`#FFFF00`).
+
 ## [1.66] (2026-11-14)
 
 ### Fixed: Only show heals cast by you, not random heals on everyone

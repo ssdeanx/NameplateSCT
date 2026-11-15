@@ -1,5 +1,5 @@
 ## Interface: 50504
-## Version: 1.66
+## Version: 1.68
 ## Title: NameplateSCT
 ## Author: AcidBomb
 ## SavedVariables: NameplateSCTDB
