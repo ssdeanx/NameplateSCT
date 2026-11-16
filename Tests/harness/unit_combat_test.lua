@@ -2383,6 +2383,7 @@ local rangedFS = _G.__lastNumberFontString
 ok(rangedFS and rangedFS._textColor
 	and rangedFS._textColor[1] > 0.99 and rangedFS._textColor[2] > 0.99 and rangedFS._textColor[3] > 0.99,
 	"a ranged auto-attack (RANGE_DAMAGE) draws white")
+eq(rangedFS and rangedFS._text, "210", "RANGE_DAMAGE still reads the amount from the right slot")
 NS:NAME_PLATE_UNIT_REMOVED("NAME_PLATE_UNIT_REMOVED", "nameplate1")
 
 -- 9. Tightened heals: pinned Flash Heal & self-only Exhilaration do not leak off-target heals.
