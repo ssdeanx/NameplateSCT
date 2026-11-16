@@ -2,7 +2,7 @@
 
 **Your damage numbers, on the nameplate they landed on.**
 
-[![Version](https://img.shields.io/badge/version-1.62-FF8D0A?style=flat-square)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-1.69-FF8D0A?style=flat-square)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-3DA639?style=flat-square)](LICENSE)
 [![Lua](https://img.shields.io/badge/Lua-5.1-2C2D72?style=flat-square)](https://www.lua.org/)
 [![Interface](https://img.shields.io/badge/interface-16001%20%7C%2012020%20%7C%20classic-4A90D9?style=flat-square)](#-compatibility)
@@ -45,7 +45,7 @@ plate — and an optional screen area for when you play without nameplates.
 
 | Client | Interface | Combat source |
 | :--- | :--- | :--- |
-| Retail (Midnight) | 120005 | combat log, or `UNIT_COMBAT` where restricted |
+| Retail (Midnight) | 120105 | combat log, or `UNIT_COMBAT` where restricted |
 | Retail (11.x) | 110207 | combat log |
 | <span style="color:#FF8D0A">Forever (Camelot)</span> | 16001 | `UNIT_COMBAT` (combat log is not available) |
 | Mists | 50504 | combat log |
@@ -261,7 +261,7 @@ scaling, crit animations) are disabled on clients that hide the combat log, and 
 
 ## 🧪 Quality
 
-- **273 offline checks** drive real events through the combat path: event source, secret values,
+- **345 offline checks** drive real events through the combat path: event source, secret values,
   de-duplication, misses, thresholds, off-target styling, the shadow, the preview, the settings
   audit and the window itself.
 - **Every setting is proved wired**: each control declares the saved key it owns, and the suite
@@ -284,13 +284,23 @@ Originally by **Justwait**. Settings window, restricted-client support and the c
 maintenance by the NameplateSCT contributors. Thanks to the Ace3, LibSharedMedia and Masque
 authors, and to everyone who reported a bug with a real error log.
 
+### Attribution and license
+
+- **License:** MIT — see [LICENSE](LICENSE). Bundled Source Sans 3 fonts are under the SIL Open
+  Font License (OFL).
+- **Starting reference:** this addon began from the **Nameplate Scrolling Combat Text** project
+  published on CurseForge at
+  <https://www.curseforge.com/wow/addons/nameplate-scrolling-combat-text> (original author
+  **Justwait**). The MIT license applies to this repository's own code; please retain this
+  attribution and the CurseForge link when redistributing or forking.
+
 <details>
 <summary><b>Development</b></summary>
 
 ```bash
 wowlua_ls check .                          # client-aware diagnostics
 luacheck NameplateSCT.lua Options/ Tests/  # style
-bash Tests/run.sh                          # 273 checks
+bash Tests/run.sh                          # 345 checks
 ```
 
 The addon targets Lua 5.1. Every TOC declares its own interface; the client picks the file. Tests
