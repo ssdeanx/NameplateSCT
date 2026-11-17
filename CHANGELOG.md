@@ -1,5 +1,29 @@
 # NameplateSCT
 
+## [1.70] (2026-11-16)
+
+### New styles: arc, sway, wave and a Classic-style rise
+
+Numbers can now rise and move at the same time, and the Classic preset's straight float is
+available as its own style.
+
+- **`arc`** rises like the vertical style while sweeping out to one side, easing to a stop at the
+  edge.
+- **`sway`** rises while drifting out to one side and back to centre.
+- **`wave`** rises while oscillating through two lateral passes with a slight decay.
+- **`classic`** is the ClassicFCT preset's motion: a straight linear rise with no easing, over the
+  Animation speed setting.
+- All four are selectable per hit type on the Animations page — outgoing, on-you and healing rows
+  alike — because they are ordinary values in the same list the other styles come from.
+- They consume the existing settings rather than adding any: **Animation speed** sets the
+  duration, and alpha, offsets, jitter, strata, icons and sizing are the shared ones every other
+  style already uses. No new saved settings, no migration.
+- The styles are implemented the same way as the existing ones: named distance constants beside
+  `ANIMATION_VERTICAL_DISTANCE` and the fountain/rainfall constants, per-number values assigned in
+  `Animate`, and the motion computed from `fontString.animatingDuration`.
+- **A style name that no longer exists no longer freezes a number.** A profile that saved a
+  removed style falls back to the default vertical style instead of leaving the text motionless.
+
 ## [1.69] (2026-11-14)
 
 ### Heal icons fall back to the spell name, and damage/miss gain the same GUID guards

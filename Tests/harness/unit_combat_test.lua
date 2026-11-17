@@ -2558,6 +2558,57 @@ plateFrames["nameplate3"] = nil
 NS:ClearAttribution()
 
 --------------------------------------------------------------------------------
+-- Animation styles ported from ClassicNumbers. They are pure position maths, so the
+-- proof is that every selectable style reaches its number and survives the tick: a
+-- missing easing curve, a nil offset or a bad branch shows up here instead of in game.
+-- This runs last on purpose: ticking the animation loop recycles FontStrings into the
+-- pool, and earlier checks assume a fresh FontString is created for them.
+--------------------------------------------------------------------------------
+
+local ANIMATION_STYLES_UNDER_TEST = {
+	"arc", "sway", "wave", "classic",
+}
+
+local finalTick = NS.frame and NS.frame._scripts and NS.frame._scripts["OnUpdate"]
+ok(finalTick ~= nil, "the animation tick is installed for the ported styles")
+
+if finalTick and plateFrames["nameplate1"] then
+	for _, style in ipairs(ANIMATION_STYLES_UNDER_TEST) do
+		_G.__now = _G.__now + 1
+		createdFontStrings = {}
+		NS:DisplayText(nil, "100", 20, style, nil, false, "Riptide", "nameplate1", 1, 1, 1)
+		local styleFontString = _G.__lastNumberFontString
+		eq(styleFontString and styleFontString.animation, style,
+			"the '" .. style .. "' style reaches the number")
+		if styleFontString then
+			eq(math.abs(styleFontString.trajectoryDirection or 0), 1,
+				"the '" .. style .. "' style has a left/right direction")
+		end
+		_G.__now = _G.__now + 0.2
+		local ticked, tickError = pcall(finalTick, NS.frame)
+		ok(ticked, "the '" .. style .. "' style animates without error", tickError)
+		ok(styleFontString and styleFontString._point
+			and type(styleFontString._point[2]) == "number"
+			and type(styleFontString._point[3]) == "number",
+			"the '" .. style .. "' style puts the number on a numeric point")
+	end
+
+	-- A lateral style must actually move sideways; otherwise the branches exist but
+	-- position nothing.
+	_G.__now = _G.__now + 1
+	createdFontStrings = {}
+	NS:DisplayText(nil, "100", 20, "sway", nil, false, "Riptide", "nameplate1", 1, 1, 1)
+	_G.__now = _G.__now + 0.2
+	local swayed, swayError = pcall(finalTick, NS.frame)
+	ok(swayed, "the sway style ticks", swayError)
+	local swayedFontString = _G.__lastNumberFontString
+	ok(swayedFontString and swayedFontString._point
+		and math.abs(swayedFontString._point[2]) > 0.5,
+		"sway actually moves the number sideways",
+		swayedFontString and swayedFontString._point and tostring(swayedFontString._point[2]))
+end
+
+--------------------------------------------------------------------------------
 
 print(("\n%d checks, %d failed"):format(checks, failures))
 os.exit(failures == 0 and 0 or 1)

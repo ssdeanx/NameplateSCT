@@ -3,7 +3,7 @@
 Orientation for any agent or automation session working in this repository.
 
 NameplateSCT — a World of Warcraft addon that draws scrolling combat text on nameplates or a
-screen area. Version 1.69. Read `CHANGELOG.md` first: its newest entry is the current state.
+screen area. Version 1.70. Read `CHANGELOG.md` first: its newest entry is the current state.
 
 ## 1. Offline verification (no game client needed)
 
@@ -11,7 +11,7 @@ screen area. Version 1.69. Read `CHANGELOG.md` first: its newest entry is the cu
 | :--- | :--- | :--- |
 | `wowlua_ls check .` | full diagnostic pass | `No errors or warnings` (12 files, 47 library files skipped) |
 | `luacheck NameplateSCT.lua Options/ Tests/` | style/unused analysis | `0 warnings / 0 errors` |
-| `bash Tests/run.sh` | runtime behaviour | `345 checks, 0 failed` |
+| `bash Tests/run.sh` | runtime behaviour | `364 checks, 0 failed` |
 | `luac5.1 -p <file>` | syntax per file | silent |
 
 Run all four before claiming a change works. A red gate is never "done".

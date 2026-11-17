@@ -261,6 +261,10 @@ local animationValues = {
 	["fountain"] = L["Fountain"],
 	["rainfall"] = L["Rainfall"],
 	["fireworks"] = L["Fireworks"],
+	["arc"] = L["Arc"],
+	["sway"] = L["Sway"],
+	["wave"] = L["Wave"],
+	["classic"] = L["Classic"],
 	["disabled"] = L["Disabled"]
 }
 
@@ -484,6 +488,14 @@ local SMALL_HIT_EXPIRY_WINDOW = 30
 local SMALL_HIT_MULTIPIER = 0.5
 
 local ANIMATION_VERTICAL_DISTANCE = 75
+-- ClassicFCT's classic preset scrolls straight up: same distance knob style as the vertical
+-- styles, but linear and over the Animation speed setting.
+local ANIMATION_CLASSIC_DISTANCE = 32
+-- Lateral travel for the styles that rise like the vertical style and also move sideways.
+local ANIMATION_ARC_SWEEP = 30
+local ANIMATION_SWAY_WIDTH = 18
+local ANIMATION_WAVE_WIDTH = 22
+local ANIMATION_WAVE_DECAY = 0.15
 
 local ANIMATION_ARC_X_MIN = 50
 local ANIMATION_ARC_X_MAX = 150
@@ -1691,6 +1703,28 @@ local function AnimationOnUpdate()
 					local startRadius = NameplateSCT.db.profile.animations.fireworksRadius
 					xOffset = (startRadius + distance) * math.cos(angle)
 					yOffset = (startRadius + distance) * math.sin(angle)
+				elseif (fontString.animation == "arc") then
+					-- Rises like the vertical style while sweeping out to one side.
+					local direction = fontString.trajectoryDirection or 1
+					_, yOffset = verticalPath(elapsed, fontString.animatingDuration, fontString.distance)
+					xOffset = direction * LibEasing.OutQuint(elapsed, 0, fontString.arcSweep, fontString.animatingDuration)
+				elseif (fontString.animation == "sway") then
+					-- Rises while drifting out to one side and back.
+					local direction = fontString.trajectoryDirection or 1
+					local progress = elapsed / fontString.animatingDuration
+					_, yOffset = verticalPath(elapsed, fontString.animatingDuration, fontString.distance)
+					xOffset = direction * math.sin(progress * math.pi) * fontString.swayWidth
+				elseif (fontString.animation == "wave") then
+					-- Rises while oscillating through a couple of lateral passes.
+					local direction = fontString.trajectoryDirection or 1
+					local progress = elapsed / fontString.animatingDuration
+					_, yOffset = verticalPath(elapsed, fontString.animatingDuration, fontString.distance)
+					xOffset = direction * math.sin(progress * math.pi * 2.5) * fontString.waveWidth *
+						(1 - progress * ANIMATION_WAVE_DECAY)
+				elseif (fontString.animation == "classic") then
+					-- ClassicFCT's classic preset: a straight linear rise over the animation.
+					-- The duration is the Animation speed setting, like every other style.
+					yOffset = fontString.distance * (elapsed / fontString.animatingDuration)
 					-- elseif (fontString.animation == "shake") then
 					-- TODO
 				end
@@ -1732,8 +1766,12 @@ end
 local arcDirection = 1
 function NameplateSCT:Animate(fontString, anchorFrame, duration, animation)
 	animation = animation or "verticalUp"
+	-- A profile saved before a style was added or removed can still name one that no longer has
+	-- a branch; fall back to the default vertical style instead of leaving the number still.
+	if not animationValues[animation] then animation = "verticalUp" end
 
 	fontString.animation = animation
+	fontString.trajectoryDirection = (math.random() < 0.5) and -1 or 1
 	fontString.animatingDuration = duration
 	fontString.animatingStartTime = GetTime()
 	fontString.anchorFrame = anchorFrame == "player" and UIParent or anchorFrame
@@ -1742,6 +1780,17 @@ function NameplateSCT:Animate(fontString, anchorFrame, duration, animation)
 		fontString.distance = ANIMATION_VERTICAL_DISTANCE
 	elseif (animation == "verticalDown") then
 		fontString.distance = ANIMATION_VERTICAL_DISTANCE
+	elseif (animation == "classic") then
+		fontString.distance = ANIMATION_CLASSIC_DISTANCE
+	elseif (animation == "arc") then
+		fontString.distance = ANIMATION_VERTICAL_DISTANCE
+		fontString.arcSweep = ANIMATION_ARC_SWEEP
+	elseif (animation == "sway") then
+		fontString.distance = ANIMATION_VERTICAL_DISTANCE
+		fontString.swayWidth = ANIMATION_SWAY_WIDTH
+	elseif (animation == "wave") then
+		fontString.distance = ANIMATION_VERTICAL_DISTANCE
+		fontString.waveWidth = ANIMATION_WAVE_WIDTH
 	elseif (animation == "fountain") then
 		fontString.arcTop = math.random(ANIMATION_ARC_Y_TOP_MIN, ANIMATION_ARC_Y_TOP_MAX)
 		fontString.arcBottom = -math.random(ANIMATION_ARC_Y_BOTTOM_MIN, ANIMATION_ARC_Y_BOTTOM_MAX)

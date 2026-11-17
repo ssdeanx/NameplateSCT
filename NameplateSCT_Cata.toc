@@ -1,5 +1,5 @@
 ## Interface: 40402
-## Version: 1.69
+## Version: 1.70
 ## Title: NameplateSCT
 ## Author: AcidBomb
 ## SavedVariables: NameplateSCTDB

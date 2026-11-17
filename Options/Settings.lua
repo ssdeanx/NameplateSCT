@@ -317,7 +317,7 @@ end
 -- Option lists
 --------------------------------------------------------------------------------
 
-local ANIMATION_ORDER = { "verticalUp", "verticalDown", "fountain", "rainfall", "fireworks", "disabled" }
+local ANIMATION_ORDER = { "verticalUp", "verticalDown", "fountain", "rainfall", "fireworks", "arc", "sway", "wave", "classic", "disabled" }
 
 local ANIMATION_FALLBACK = {
 	verticalUp = "Vertical Up",
@@ -325,6 +325,10 @@ local ANIMATION_FALLBACK = {
 	fountain = "Fountain",
 	rainfall = "Rainfall",
 	fireworks = "Fireworks",
+	arc = "Arc",
+	sway = "Sway",
+	wave = "Wave",
+	classic = "Classic",
 	disabled = "Disabled",
 }
 
